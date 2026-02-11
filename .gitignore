@@ -211,3 +211,8 @@ __marimo__/
 .zed
 .vscode
 .skills
+
+# Project data artifacts
+data/
+data.tar.zst
+*.tar.zst
