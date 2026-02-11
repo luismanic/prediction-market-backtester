@@ -7,9 +7,13 @@ on:
 jobs:
   lint-type-test:
     runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: .venv
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

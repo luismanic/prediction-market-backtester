@@ -54,6 +54,7 @@ include = ["src", "tests"]
 exclude = ["vendor"]
 venvPath = "."
 venv = ".venv"
+extraPaths = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

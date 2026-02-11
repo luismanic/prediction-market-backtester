@@ -216,6 +216,6 @@ __marimo__/
 .DS_Store
 
 # Project data artifacts
-data/
+/data/
 data.tar.zst
 *.tar.zst
