@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -33,7 +34,17 @@ def test_real_polymarket_trades_loader_returns_valid_sample(tmp_path: Path) -> N
     )
 
     assert sample.height > 0
-    assert sample["price"].min() >= 0.0
-    assert sample["price"].max() <= 1.0
-    assert sample["size"].min() > 0.0
-    assert set(sample["side"].drop_nulls().to_list()).issubset({"buy", "sell", "unknown"})
+    min_price = cast(float | None, sample["price"].min())
+    max_price = cast(float | None, sample["price"].max())
+    min_size = cast(float | None, sample["size"].min())
+
+    assert min_price is not None
+    assert max_price is not None
+    assert min_size is not None
+
+    assert min_price >= 0.0
+    assert max_price <= 1.0
+    assert min_size > 0.0
+
+    sides = cast(list[str], sample["side"].drop_nulls().to_list())
+    assert set(sides).issubset({"buy", "sell", "unknown"})
