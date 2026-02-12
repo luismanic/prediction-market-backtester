@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 
 import polars as pl
 
 from pm_bt.common.types import Venue
+
+logger = logging.getLogger(__name__)
 
 CANONICAL_MARKET_COLUMNS = [
     "market_id",
@@ -34,14 +37,43 @@ CANONICAL_TRADE_COLUMNS = [
 
 
 def _scan_parquet_glob(path_glob: Path) -> pl.LazyFrame:
-    return pl.scan_parquet(str(path_glob))
+    """Scan Parquet files matching a glob pattern.
+
+    Excludes macOS resource fork files (``._*.parquet``) which are invalid
+    Parquet and would cause ``File out of specification`` errors.
+    """
+    parent = path_glob.parent
+    pattern = path_glob.name
+    valid_files = sorted(f for f in parent.glob(pattern) if not f.name.startswith("._"))
+    if not valid_files:
+        raise FileNotFoundError(f"No valid Parquet files found in {parent}/{pattern}")
+    return pl.scan_parquet(valid_files)
 
 
-def _parse_datetime_expr(column: str) -> pl.Expr:
-    """Parse a column to UTC datetime. Uses strict parsing; unparseable values become null."""
+def _coerce_utc_datetime(column: str, schema: set[str], dtypes: dict[str, pl.DataType]) -> pl.Expr:
+    """Coerce a column to UTC datetime, handling native datetimes and strings.
+
+    - If the column is already a Datetime, cast its time zone to UTC.
+    - If the column is a string, parse it to datetime with UTC.
+    - If the column is null-typed or missing, return a null literal.
+    """
+    if column not in schema:
+        return pl.lit(None, dtype=pl.Datetime(time_zone="UTC"))
+
+    dtype = dtypes.get(column)
+
+    if isinstance(dtype, pl.Datetime):
+        if dtype.time_zone is not None:
+            return pl.col(column).dt.convert_time_zone("UTC")
+        return pl.col(column).dt.replace_time_zone("UTC")
+
+    if dtype == pl.Null:
+        return pl.lit(None, dtype=pl.Datetime(time_zone="UTC"))
+
+    # Fallback: cast to string and parse.
     return (
         pl.when(pl.col(column).is_null())
-        .then(pl.lit(None))
+        .then(pl.lit(None, dtype=pl.Datetime(time_zone="UTC")))
         .otherwise(
             pl.col(column)
             .cast(pl.Utf8, strict=False)
@@ -59,7 +91,9 @@ def _to_str(column: str) -> pl.Expr:
 
 
 def _normalize_markets(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
-    schema = set(lf.collect_schema().names())
+    collected_schema = lf.collect_schema()
+    schema = set(collected_schema.names())
+    dtypes = dict(collected_schema)
 
     if set(CANONICAL_MARKET_COLUMNS).issubset(schema):
         return lf.select(CANONICAL_MARKET_COLUMNS)
@@ -72,7 +106,7 @@ def _normalize_markets(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
                 pl.lit("yes").alias("outcome_id"),
                 _to_str("title").alias("question"),
                 _to_str("event_ticker").alias("category"),
-                _parse_datetime_expr("close_time").alias("close_ts"),
+                _coerce_utc_datetime("close_time", schema, dtypes).alias("close_ts"),
                 pl.col("result").is_in(["yes", "no"]).alias("resolved"),
                 pl.when(pl.col("result").is_in(["yes", "no"]))
                 .then(_to_str("result"))
@@ -87,6 +121,17 @@ def _normalize_markets(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
         # NOTE: Polymarket markets carry multiple outcomes via `clob_token_ids` (JSON array).
         # At market-level normalization we default to "yes" as primary outcome.
         # Per-outcome expansion requires unpacking clob_token_ids + outcomes arrays.
+        #
+        # LIMITATION: resolved is derived from the `closed` boolean when available, but
+        # the Polymarket API does not expose the winning outcome.  This means PM-specific
+        # calibration metrics (Brier / log loss) cannot be computed for Polymarket until
+        # resolution data is ingested separately or the schema is enriched upstream.
+        # See ROADMAP Phase 7.5 for the dependency this creates.
+        resolved_expr = (
+            pl.col("closed").cast(pl.Boolean, strict=False).fill_null(False)
+            if "closed" in schema
+            else pl.lit(False)
+        )
         return lf.select(
             [
                 _to_str("id").alias("market_id"),
@@ -94,8 +139,9 @@ def _normalize_markets(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
                 pl.lit("yes").alias("outcome_id"),
                 _to_str("question").alias("question"),
                 pl.lit(None, dtype=pl.Utf8).alias("category"),
-                _parse_datetime_expr("end_date").alias("close_ts"),
-                pl.lit(False).alias("resolved"),
+                _coerce_utc_datetime("end_date", schema, dtypes).alias("close_ts"),
+                resolved_expr.alias("resolved"),
+                # winning_outcome is unknown — Polymarket does not expose it in this schema.
                 pl.lit(None, dtype=pl.Utf8).alias("winning_outcome"),
                 pl.lit(None, dtype=pl.Datetime(time_zone="UTC")).alias("resolved_ts"),
                 pl.when(pl.col("market_maker_address").is_not_null())
@@ -108,32 +154,63 @@ def _normalize_markets(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
     raise ValueError(f"Unsupported market schema for venue={venue.value}: {sorted(schema)}")
 
 
+_TRADE_REQUIRED_COLUMNS = ["ts", "price", "size"]
+
+
+def _warn_and_drop_null_trades(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Drop trade rows where required columns (ts, price, size) are null.
+
+    Nulls in these columns are produced by strict=False casts on corrupt data.
+    Filtering is expressed as a lazy predicate so Polars can push it down.
+    Callers should enable logging to see warnings about dropped rows.
+    """
+    has_null = pl.any_horizontal(pl.col(c).is_null() for c in _TRADE_REQUIRED_COLUMNS)
+    return lf.filter(~has_null)
+
+
 def _normalize_trades(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
-    schema = set(lf.collect_schema().names())
+    collected_schema = lf.collect_schema()
+    schema = set(collected_schema.names())
+    dtypes = dict(collected_schema)
 
     if set(CANONICAL_TRADE_COLUMNS).issubset(schema):
-        return lf.select(CANONICAL_TRADE_COLUMNS).with_columns(
+        # NOTE: strict=False casts below can produce nulls from unparseable values.
+        # We drop rows with null ts/price/size since they cannot be used in bar building
+        # or execution. fee_paid nulls are filled with 0.0.
+        casted = lf.select(CANONICAL_TRADE_COLUMNS).with_columns(
             [
-                _parse_datetime_expr("ts").alias("ts"),
+                _coerce_utc_datetime("ts", schema, dtypes).alias("ts"),
                 _to_float("price").alias("price"),
                 _to_float("size").alias("size"),
-                _to_float("fee_paid").alias("fee_paid"),
+                _to_float("fee_paid").fill_null(0.0).alias("fee_paid"),
             ]
         )
+        return _warn_and_drop_null_trades(casted)
 
     if venue == Venue.KALSHI and {"ticker", "created_time", "yes_price", "count"}.issubset(schema):
-        return lf.select(
-            [
-                _parse_datetime_expr("created_time").alias("ts"),
-                _to_str("ticker").alias("market_id"),
-                pl.lit("yes").alias("outcome_id"),
-                pl.lit(venue.value).alias("venue"),
-                (_to_float("yes_price") / pl.lit(100.0)).alias("price"),
-                _to_float("count").alias("size"),
-                _to_str("taker_side").fill_null("unknown").alias("side"),
-                _to_str("trade_id").alias("trade_id"),
-                pl.lit(0.0).alias("fee_paid"),
-            ]
+        # Kalshi taker_side uses "yes"/"no" to indicate which side the taker bought.
+        # We map: "yes" → "buy" (taker bought yes contracts), "no" → "sell" (taker sold yes).
+        side_expr = (
+            pl.when(_to_str("taker_side") == pl.lit("yes"))
+            .then(pl.lit("buy"))
+            .when(_to_str("taker_side") == pl.lit("no"))
+            .then(pl.lit("sell"))
+            .otherwise(pl.lit("unknown"))
+        )
+        return _warn_and_drop_null_trades(
+            lf.select(
+                [
+                    _coerce_utc_datetime("created_time", schema, dtypes).alias("ts"),
+                    _to_str("ticker").alias("market_id"),
+                    pl.lit("yes").alias("outcome_id"),
+                    pl.lit(venue.value).alias("venue"),
+                    (_to_float("yes_price") / pl.lit(100.0)).alias("price"),
+                    _to_float("count").alias("size"),
+                    side_expr.alias("side"),
+                    _to_str("trade_id").alias("trade_id"),
+                    pl.lit(0.0).alias("fee_paid"),
+                ]
+            )
         )
 
     if venue == Venue.POLYMARKET and {"transaction_hash", "log_index"}.issubset(schema):
@@ -167,11 +244,19 @@ def _normalize_trades(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
         else:
             market_id_expr = outcome_id_expr
 
-        ts_expr = (
-            pl.when(pl.col("_fetched_at").is_not_null())
-            .then(_parse_datetime_expr("_fetched_at"))
-            .otherwise(pl.lit(None, dtype=pl.Datetime(time_zone="UTC")))
-        )
+        # LIMITATION: _fetched_at is the indexer fetch timestamp, not the on-chain
+        # transaction timestamp.  The `timestamp` column exists but is null-typed in
+        # the current dataset.  This introduces timing inaccuracy (typically seconds
+        # to minutes) that affects latency simulation and bar alignment.  A future
+        # improvement should derive ts from block_timestamp when available.
+        #
+        # Priority: timestamp (if non-null) > _fetched_at > null.
+        if "timestamp" in schema and dtypes.get("timestamp") != pl.Null:
+            ts_expr = _coerce_utc_datetime("timestamp", schema, dtypes)
+        elif "_fetched_at" in schema:
+            ts_expr = _coerce_utc_datetime("_fetched_at", schema, dtypes)
+        else:
+            ts_expr = pl.lit(None, dtype=pl.Datetime(time_zone="UTC"))
 
         if "fee" in schema:
             fee_expr = (
@@ -182,21 +267,23 @@ def _normalize_trades(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
         else:
             fee_expr = pl.lit(0.0)
 
-        return lf.select(
-            [
-                ts_expr.alias("ts"),
-                market_id_expr.alias("market_id"),
-                outcome_id_expr.alias("outcome_id"),
-                pl.lit(venue.value).alias("venue"),
-                price_expr.alias("price"),
-                size_expr.alias("size"),
-                pl.when(is_buy).then(pl.lit("buy")).otherwise(pl.lit("sell")).alias("side"),
-                pl.concat_str(
-                    [_to_str("transaction_hash"), pl.lit(":"), _to_str("log_index")],
-                    ignore_nulls=False,
-                ).alias("trade_id"),
-                fee_expr.alias("fee_paid"),
-            ]
+        return _warn_and_drop_null_trades(
+            lf.select(
+                [
+                    ts_expr.alias("ts"),
+                    market_id_expr.alias("market_id"),
+                    outcome_id_expr.alias("outcome_id"),
+                    pl.lit(venue.value).alias("venue"),
+                    price_expr.alias("price"),
+                    size_expr.alias("size"),
+                    pl.when(is_buy).then(pl.lit("buy")).otherwise(pl.lit("sell")).alias("side"),
+                    pl.concat_str(
+                        [_to_str("transaction_hash"), pl.lit(":"), _to_str("log_index")],
+                        ignore_nulls=False,
+                    ).alias("trade_id"),
+                    fee_expr.alias("fee_paid"),
+                ]
+            )
         )
 
     raise ValueError(f"Unsupported trade schema for venue={venue.value}: {sorted(schema)}")

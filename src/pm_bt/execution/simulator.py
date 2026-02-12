@@ -1,24 +1,25 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
-from pm_bt.common.models import BacktestConfig, Fill, OrderIntent
+from pydantic import Field
+
+from pm_bt.common.models import BacktestConfig, DomainModel, Fill, OrderIntent
 from pm_bt.common.types import OrderSide
 
 PositionKey = tuple[str, str]
 
 
-@dataclass(slots=True)
-class ExecutionConfig:
-    fee_bps: float = 0.0
-    slippage_bps: float = 0.0
-    slippage_volume_k: float | None = None
-    default_spread: float = 0.02
-    latency_bars: int = 0
-    max_position_size: float = 100.0
-    max_gross_exposure: float = 10_000.0
+class ExecutionConfig(DomainModel):
+    fee_bps: float = Field(default=0.0, ge=0.0)
+    slippage_bps: float = Field(default=0.0, ge=0.0)
+    slippage_volume_k: float | None = Field(default=None, ge=0.0)
+    default_spread: float = Field(default=0.02, ge=0.0, le=1.0)
+    latency_bars: int = Field(default=0, ge=0)
+    max_position_size: float = Field(default=100.0, gt=0.0)
+    max_gross_exposure: float = Field(default=10_000.0, gt=0.0)
 
     @classmethod
     def from_backtest_config(cls, config: BacktestConfig) -> ExecutionConfig:
@@ -31,21 +32,29 @@ class ExecutionConfig:
         )
 
 
-@dataclass(slots=True)
-class MarketSnapshot:
+class MarketSnapshot(DomainModel):
+    """Point-in-time market state used by the execution simulator.
+
+    mid_price is clamped to [0, 1] as prediction market prices represent
+    implied probabilities.  spread is intentionally nullable: when absent the
+    simulator estimates it from recent_prices or falls back to a default.
+    recent_volume is nullable for the same reason.
+    """
+
     ts: datetime
     market_id: str
     outcome_id: str
-    mid_price: float
-    spread: float | None = None
-    recent_volume: float | None = None
+    mid_price: float = Field(ge=0.0, le=1.0)
+    spread: float | None = Field(default=None, ge=0.0, le=1.0)
+    recent_volume: float | None = Field(default=None, ge=0.0)
     recent_prices: Sequence[float] | None = None
 
 
-@dataclass(slots=True)
-class AccountState:
+class AccountState(DomainModel):
+    """Mutable account state tracked by the simulator."""
+
     cash: float = 10_000.0
-    positions: dict[PositionKey, float] = field(default_factory=dict)
+    positions: dict[PositionKey, float] = Field(default_factory=dict)
 
 
 @dataclass(slots=True)
