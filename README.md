@@ -95,6 +95,25 @@ The CLI returns exit code `0` on success and `1` on failure. Error messages incl
 - No trade data found for the specified market/time range
 - Invalid date range (`start_ts >= end_ts`)
 
+## Running Batch Backtests
+
+Use `pm-bt batch` to run one strategy across top-N markets per venue:
+
+```bash
+pm-bt batch \
+  --strategy momentum \
+  --config configs/momentum/default.yaml \
+  --venues kalshi polymarket \
+  --top-n 50 \
+  --min-trades 20 \
+  --output-root output/runs
+```
+
+Batch outputs are written under `<output-root>/<name>_<batch-id>/`:
+- `summary.csv` - per-market performance + tradability metrics
+- `data_quality.json` - per-market quality checks and gate status
+- `checkpoint.json` - progress checkpoint for resumable runs (`--resume`)
+
 ## Data Setup
 
 ```bash

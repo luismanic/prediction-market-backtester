@@ -6,6 +6,7 @@ from pathlib import Path
 
 import polars as pl
 
+from pm_bt.common.categories import kalshi_category_expr
 from pm_bt.common.types import Venue
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ def _normalize_markets(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
                 pl.lit(venue.value).alias("venue"),
                 pl.lit("yes").alias("outcome_id"),
                 _to_str("title").alias("question"),
-                _to_str("event_ticker").alias("category"),
+                kalshi_category_expr("event_ticker").alias("category"),
                 _coerce_utc_datetime("close_time", schema, dtypes).alias("close_ts"),
                 pl.col("result").is_in(["yes", "no"]).alias("resolved"),
                 pl.when(pl.col("result").is_in(["yes", "no"]))
@@ -122,16 +123,43 @@ def _normalize_markets(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
         # At market-level normalization we default to "yes" as primary outcome.
         # Per-outcome expansion requires unpacking clob_token_ids + outcomes arrays.
         #
-        # LIMITATION: resolved is derived from the `closed` boolean when available, but
-        # the Polymarket API does not expose the winning outcome.  This means PM-specific
-        # calibration metrics (Brier / log loss) cannot be computed for Polymarket until
-        # resolution data is ingested separately or the schema is enriched upstream.
-        # See ROADMAP Phase 7.5 for the dependency this creates.
-        resolved_expr = (
+        # Resolution heuristic: for closed binary markets the `outcome_prices` JSON array
+        # contains final settlement prices. When one outcome is > 0.99 and the other < 0.01
+        # the market is considered resolved. This covers ~45% of closed markets; the rest
+        # have both prices at 0 (legacy/AMM-era markets) and remain unresolved.
+        #
+        # The heuristic is ported from Jon Becker's prediction-market-analysis project.
+        has_outcome_prices = "outcome_prices" in schema
+
+        is_closed = (
             pl.col("closed").cast(pl.Boolean, strict=False).fill_null(False)
             if "closed" in schema
             else pl.lit(False)
         )
+
+        if has_outcome_prices:
+            # Extract the two outcome prices from JSON array string '["0.99", "0.01"]'.
+            p0 = (
+                _to_str("outcome_prices").str.json_path_match("$[0]").cast(pl.Float64, strict=False)
+            )
+            p1 = (
+                _to_str("outcome_prices").str.json_path_match("$[1]").cast(pl.Float64, strict=False)
+            )
+            # A market is resolved when one outcome settles near 1 and the other near 0.
+            outcome_0_won = (p0 > 0.99) & (p1 < 0.01)
+            outcome_1_won = (p1 > 0.99) & (p0 < 0.01)
+            is_resolved = is_closed & (outcome_0_won | outcome_1_won)
+            winning_outcome_expr = (
+                pl.when(is_resolved & outcome_0_won)
+                .then(pl.lit("yes"))
+                .when(is_resolved & outcome_1_won)
+                .then(pl.lit("no"))
+                .otherwise(pl.lit(None, dtype=pl.Utf8))
+            )
+        else:
+            is_resolved = pl.lit(False)
+            winning_outcome_expr = pl.lit(None, dtype=pl.Utf8)
+
         return lf.select(
             [
                 _to_str("id").alias("market_id"),
@@ -140,9 +168,8 @@ def _normalize_markets(lf: pl.LazyFrame, venue: Venue) -> pl.LazyFrame:
                 _to_str("question").alias("question"),
                 pl.lit(None, dtype=pl.Utf8).alias("category"),
                 _coerce_utc_datetime("end_date", schema, dtypes).alias("close_ts"),
-                resolved_expr.alias("resolved"),
-                # winning_outcome is unknown — Polymarket does not expose it in this schema.
-                pl.lit(None, dtype=pl.Utf8).alias("winning_outcome"),
+                is_resolved.alias("resolved"),
+                winning_outcome_expr.alias("winning_outcome"),
                 pl.lit(None, dtype=pl.Datetime(time_zone="UTC")).alias("resolved_ts"),
                 pl.when(pl.col("market_maker_address").is_not_null())
                 .then(pl.lit("amm"))

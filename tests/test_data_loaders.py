@@ -71,6 +71,25 @@ def _write_polymarket_trades_fixture(data_root: Path) -> None:
     trades_df.write_parquet(data_root / "polymarket" / "trades" / "trades_0_2.parquet")
 
 
+def _write_kalshi_raw_markets_fixture(data_root: Path) -> None:
+    (data_root / "kalshi" / "markets").mkdir(parents=True, exist_ok=True)
+    markets_df = pl.DataFrame(
+        {
+            "ticker": ["KX-PRES-2024-DJT", "KX-NFL-2026-SB", "KX-UNKNOWN-2026"],
+            "event_ticker": ["PRES-2024-DJT", "NFLGAME-2026-SB", "NO_MATCH-2026"],
+            "title": ["Will DJT win?", "Who wins the Super Bowl?", "Unknown market"],
+            "status": ["closed", "open", "open"],
+            "result": ["yes", "", ""],
+            "close_time": [
+                "2024-11-06T00:00:00Z",
+                "2026-02-10T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ],
+        }
+    )
+    markets_df.write_parquet(data_root / "kalshi" / "markets" / "markets_raw_0_3.parquet")
+
+
 def test_load_markets_filters_market_id(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     _write_fixture_parquet(data_root)
@@ -111,3 +130,15 @@ def test_load_trades_polymarket_uses_condition_id_for_market_id(tmp_path: Path) 
     assert result.height == 2
     assert set(result["market_id"].to_list()) == {"0xmarket1"}
     assert set(result["outcome_id"].to_list()) == {"555"}
+
+
+def test_load_markets_kalshi_raw_schema_maps_category_groups(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    _write_kalshi_raw_markets_fixture(data_root)
+
+    result = load_markets("kalshi", data_root=data_root).collect()
+    categories = dict(zip(result["market_id"].to_list(), result["category"].to_list(), strict=True))
+
+    assert categories["KX-PRES-2024-DJT"] == "politics"
+    assert categories["KX-NFL-2026-SB"] == "sports"
+    assert categories["KX-UNKNOWN-2026"] == "other"

@@ -1,5 +1,6 @@
 """Shared domain models, types, and utility helpers."""
 
+from pm_bt.common.categories import classify_kalshi_event_ticker, kalshi_category_expr
 from pm_bt.common.models import (
     BacktestConfig,
     Bar,
@@ -34,6 +35,9 @@ from pm_bt.common.utils import (
 )
 
 __all__ = [
+    # Categories
+    "classify_kalshi_event_ticker",
+    "kalshi_category_expr",
     # Models
     "BacktestConfig",
     "Bar",
