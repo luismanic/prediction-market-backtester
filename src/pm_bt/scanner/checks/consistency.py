@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from typing import cast
 
 import polars as pl
 
@@ -9,6 +10,24 @@ from pm_bt.common.types import AlertSeverity, Venue
 from pm_bt.scanner.models import Alert, make_alert_id
 
 logger = logging.getLogger(__name__)
+
+
+def _as_str(value: object, *, field: str) -> str:
+    if isinstance(value, str):
+        return value
+    raise TypeError(f"Expected str for {field}, got {type(value)!r}")
+
+
+def _as_float(value: object, *, field: str) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise TypeError(f"Expected float for {field}, got {type(value)!r}")
+
+
+def _as_datetime(value: object, *, field: str) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    raise TypeError(f"Expected datetime for {field}, got {type(value)!r}")
 
 
 def check_complement_sum(
@@ -61,12 +80,21 @@ def check_complement_sum(
     )
 
     alerts: list[Alert] = []
-    for row in deviations.iter_rows(named=True):
-        deviation: float = row["deviation"]
+    market_ids = cast(list[object], deviations.get_column("market_id").to_list())
+    venues = cast(list[object], deviations.get_column("venue").to_list())
+    window_tss = cast(list[object], deviations.get_column("window_ts").to_list())
+    yes_vwaps = cast(list[object], deviations.get_column("yes").to_list())
+    no_vwaps = cast(list[object], deviations.get_column("no").to_list())
+    deviation_values = cast(list[object], deviations.get_column("deviation").to_list())
+    for idx in range(deviations.height):
+        market_id = _as_str(market_ids[idx], field="market_id")
+        venue_raw = _as_str(venues[idx], field="venue")
+        ts = _as_datetime(window_tss[idx], field="window_ts")
+        yes_vwap = _as_float(yes_vwaps[idx], field="yes")
+        no_vwap = _as_float(no_vwaps[idx], field="no")
+        deviation = _as_float(deviation_values[idx], field="deviation")
         severity = AlertSeverity.HIGH if deviation > 2 * tolerance else AlertSeverity.MEDIUM
-        ts = row["window_ts"]
-        market_id: str = row["market_id"]
-        venue = Venue(row["venue"])
+        venue = Venue(venue_raw)
         alerts.append(
             Alert(
                 alert_id=make_alert_id("complement_sum_deviation", market_id, ts),
@@ -76,8 +104,8 @@ def check_complement_sum(
                 reason="complement_sum_deviation",
                 severity=severity,
                 supporting_stats={
-                    "yes_vwap": row["yes"],
-                    "no_vwap": row["no"],
+                    "yes_vwap": yes_vwap,
+                    "no_vwap": no_vwap,
                     "deviation": deviation,
                 },
             )
@@ -101,9 +129,15 @@ def check_mutually_exclusive(
     if event_group_expr is None:
         event_group_expr = pl.col("market_id").str.replace(r"-[^-]+$", "")
 
+    market_keys = markets.select(["market_id", "venue"]).unique()
+
     # Per-market VWAP from trades
-    market_vwap = trades.group_by(["market_id", "venue"]).agg(
-        ((pl.col("price") * pl.col("size")).sum() / pl.col("size").sum()).alias("vwap"),
+    market_vwap = (
+        trades.group_by(["market_id", "venue"])
+        .agg(
+            ((pl.col("price") * pl.col("size")).sum() / pl.col("size").sum()).alias("vwap"),
+        )
+        .join(market_keys, on=["market_id", "venue"], how="inner")
     )
 
     # Add event_group column
@@ -122,11 +156,17 @@ def check_mutually_exclusive(
     )
 
     alerts: list[Alert] = []
-    for row in group_stats.iter_rows(named=True):
-        outcome_sum: float = row["outcome_sum"]
+    outcome_sums = cast(list[object], group_stats.get_column("outcome_sum").to_list())
+    venues = cast(list[object], group_stats.get_column("venue").to_list())
+    event_groups = cast(list[object], group_stats.get_column("event_group").to_list())
+    n_outcomes_values = cast(list[object], group_stats.get_column("n_outcomes").to_list())
+    for idx in range(group_stats.height):
+        outcome_sum = _as_float(outcome_sums[idx], field="outcome_sum")
+        venue_raw = _as_str(venues[idx], field="venue")
+        event_group = _as_str(event_groups[idx], field="event_group")
+        n_outcomes = _as_float(n_outcomes_values[idx], field="n_outcomes")
         severity = AlertSeverity.HIGH if outcome_sum > 1.0 + 2 * tolerance else AlertSeverity.MEDIUM
-        venue = Venue(row["venue"])
-        event_group: str = row["event_group"]
+        venue = Venue(venue_raw)
         alerts.append(
             Alert(
                 alert_id=make_alert_id(
@@ -142,7 +182,7 @@ def check_mutually_exclusive(
                 severity=severity,
                 supporting_stats={
                     "outcome_sum": outcome_sum,
-                    "n_outcomes": float(row["n_outcomes"]),
+                    "n_outcomes": n_outcomes,
                 },
             )
         )

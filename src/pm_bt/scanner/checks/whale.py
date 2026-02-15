@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from typing import cast
 
 import polars as pl
 
@@ -8,6 +10,24 @@ from pm_bt.common.types import AlertSeverity, Venue
 from pm_bt.scanner.models import Alert, make_alert_id
 
 logger = logging.getLogger(__name__)
+
+
+def _as_str(value: object, *, field: str) -> str:
+    if isinstance(value, str):
+        return value
+    raise TypeError(f"Expected str for {field}, got {type(value)!r}")
+
+
+def _as_float(value: object, *, field: str) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise TypeError(f"Expected float for {field}, got {type(value)!r}")
+
+
+def _as_datetime(value: object, *, field: str) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    raise TypeError(f"Expected datetime for {field}, got {type(value)!r}")
 
 
 def check_whale_trades(
@@ -43,8 +63,22 @@ def check_whale_trades(
     )
 
     alerts: list[Alert] = []
-    for row in whales.iter_rows(named=True):
-        ratio: float = row["size_ratio"]
+    market_ids = cast(list[object], whales.get_column("market_id").to_list())
+    venues = cast(list[object], whales.get_column("venue").to_list())
+    tss = cast(list[object], whales.get_column("ts").to_list())
+    sizes = cast(list[object], whales.get_column("size").to_list())
+    rolling_avgs = cast(list[object], whales.get_column("rolling_avg_size").to_list())
+    ratios = cast(list[object], whales.get_column("size_ratio").to_list())
+    prices = cast(list[object], whales.get_column("price").to_list())
+
+    for idx in range(whales.height):
+        market_id = _as_str(market_ids[idx], field="market_id")
+        venue_raw = _as_str(venues[idx], field="venue")
+        ts = _as_datetime(tss[idx], field="ts")
+        trade_size = _as_float(sizes[idx], field="size")
+        rolling_avg = _as_float(rolling_avgs[idx], field="rolling_avg_size")
+        ratio = _as_float(ratios[idx], field="size_ratio")
+        price = _as_float(prices[idx], field="price")
         if ratio > 10.0:
             severity = AlertSeverity.HIGH
         elif ratio > 5.0:
@@ -52,9 +86,7 @@ def check_whale_trades(
         else:
             severity = AlertSeverity.LOW
 
-        ts = row["ts"]
-        market_id: str = row["market_id"]
-        venue = Venue(row["venue"])
+        venue = Venue(venue_raw)
         alerts.append(
             Alert(
                 alert_id=make_alert_id("whale_trade", market_id, ts),
@@ -64,10 +96,10 @@ def check_whale_trades(
                 reason="whale_trade",
                 severity=severity,
                 supporting_stats={
-                    "trade_size": row["size"],
-                    "rolling_avg_size": row["rolling_avg_size"],
+                    "trade_size": trade_size,
+                    "rolling_avg_size": rolling_avg,
                     "size_ratio": ratio,
-                    "price": row["price"],
+                    "price": price,
                 },
             )
         )
@@ -102,13 +134,25 @@ def check_price_impact(
     ).collect()
 
     alerts: list[Alert] = []
-    for row in impacts.iter_rows(named=True):
-        score: float = row["impact_score"]
+    market_ids = cast(list[object], impacts.get_column("market_id").to_list())
+    venues = cast(list[object], impacts.get_column("venue").to_list())
+    tss = cast(list[object], impacts.get_column("ts").to_list())
+    impact_scores = cast(list[object], impacts.get_column("impact_score").to_list())
+    price_diffs = cast(list[object], impacts.get_column("price_diff").to_list())
+    sizes = cast(list[object], impacts.get_column("size").to_list())
+    prices = cast(list[object], impacts.get_column("price").to_list())
+
+    for idx in range(impacts.height):
+        market_id = _as_str(market_ids[idx], field="market_id")
+        venue_raw = _as_str(venues[idx], field="venue")
+        ts = _as_datetime(tss[idx], field="ts")
+        score = _as_float(impact_scores[idx], field="impact_score")
+        price_diff = _as_float(price_diffs[idx], field="price_diff")
+        size = _as_float(sizes[idx], field="size")
+        price = _as_float(prices[idx], field="price")
         severity = AlertSeverity.HIGH if score > 3 * impact_threshold else AlertSeverity.MEDIUM
 
-        ts = row["ts"]
-        market_id: str = row["market_id"]
-        venue = Venue(row["venue"])
+        venue = Venue(venue_raw)
         alerts.append(
             Alert(
                 alert_id=make_alert_id("price_impact", market_id, ts),
@@ -118,10 +162,10 @@ def check_price_impact(
                 reason="price_impact",
                 severity=severity,
                 supporting_stats={
-                    "price_diff": abs(row["price_diff"]),
-                    "size": row["size"],
+                    "price_diff": abs(price_diff),
+                    "size": size,
                     "impact_score": score,
-                    "price": row["price"],
+                    "price": price,
                 },
             )
         )

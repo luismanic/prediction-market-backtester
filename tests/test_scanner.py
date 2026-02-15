@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import polars as pl
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from pm_bt.cli import run_cli
 from pm_bt.common.types import AlertSeverity, Venue
@@ -45,6 +45,8 @@ _CANONICAL_MARKET_SCHEMA = {
     "market_structure": pl.Utf8,
 }
 
+_JSON_ROWS_ADAPTER = TypeAdapter(list[dict[str, object]])
+
 
 def _make_trades(rows: list[dict[str, object]]) -> pl.LazyFrame:
     return pl.DataFrame(rows, schema=_CANONICAL_TRADE_SCHEMA).lazy()
@@ -52,6 +54,10 @@ def _make_trades(rows: list[dict[str, object]]) -> pl.LazyFrame:
 
 def _make_markets(rows: list[dict[str, object]]) -> pl.LazyFrame:
     return pl.DataFrame(rows, schema=_CANONICAL_MARKET_SCHEMA).lazy()
+
+
+def _load_json_rows(path: Path) -> list[dict[str, object]]:
+    return _JSON_ROWS_ADAPTER.validate_json(path.read_text("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +81,13 @@ class TestModels:
 
     def test_scanner_config_rejects_extra_fields(self) -> None:
         with pytest.raises(ValidationError):
-            ScannerConfig.model_validate({"unknown_field": 1})
+            _ = ScannerConfig.model_validate({"unknown_field": 1})
 
     def test_scanner_config_tolerance_bounds(self) -> None:
         with pytest.raises(ValidationError):
-            ScannerConfig(complement_sum_tolerance=0.0)
+            _ = ScannerConfig(complement_sum_tolerance=0.0)
         with pytest.raises(ValidationError):
-            ScannerConfig(complement_sum_tolerance=1.5)
+            _ = ScannerConfig(complement_sum_tolerance=1.5)
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +318,7 @@ class TestMutuallyExclusive:
         alerts = check_mutually_exclusive(markets, trades, tolerance=0.10)
         assert len(alerts) == 1
         assert alerts[0].reason == "mutually_exclusive_sum"
-        assert alerts[0].supporting_stats["outcome_sum"] == pytest.approx(1.50)
+        assert abs(alerts[0].supporting_stats["outcome_sum"] - 1.50) < 1e-12
 
     def test_silent_for_single_outcome_groups(self) -> None:
         """A group with only 1 market should never fire."""
@@ -463,7 +469,7 @@ class TestPriceImpact:
         alerts = check_price_impact(_impact_trades(), impact_threshold=0.01)
         assert len(alerts) == 1
         assert alerts[0].reason == "price_impact"
-        assert alerts[0].supporting_stats["impact_score"] == pytest.approx(0.05)
+        assert abs(alerts[0].supporting_stats["impact_score"] - 0.05) < 1e-12
 
     def test_silent_for_normal_trades(self) -> None:
         trades = _make_trades(
@@ -574,15 +580,15 @@ class TestOutput:
     def test_json_round_trip(self, tmp_path: Path) -> None:
         path = tmp_path / "alerts.json"
         write_alerts_json(_sample_alerts(), path)
-        payload = json.loads(path.read_text("utf-8"))
-        assert isinstance(payload, list)
+        payload = _load_json_rows(path)
         assert len(payload) == 1
-        assert payload[0]["reason"] == "whale_trade"
+        reason = cast(str, payload[0]["reason"])
+        assert reason == "whale_trade"
 
     def test_json_empty_list(self, tmp_path: Path) -> None:
         path = tmp_path / "alerts.json"
         write_alerts_json([], path)
-        payload = json.loads(path.read_text("utf-8"))
+        payload = _load_json_rows(path)
         assert payload == []
 
     def test_csv_columns(self, tmp_path: Path) -> None:
