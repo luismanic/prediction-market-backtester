@@ -10,21 +10,20 @@ Kalshi hierarchy:  Series → Event → Market
 
 series_ticker is NOT stored in the parquet (the indexer never fetched it),
 but it is derivable: strip the date suffix from event_ticker.
-  KXHIGHNY-25JAN15  →  KXHIGHNY
+
+Supported date suffix formats (applied in order):
+  1. -DDMMMDDYY  e.g. KXBTCD-26FEB0617  -> KXBTCD   (daily/hourly crypto with hour)
+  2. -DDMMMYY    e.g. KXHIGHNY-25JAN15  -> KXHIGHNY  (weather / standard daily)
 
 We group by derived series_ticker and require COUNT(DISTINCT event_ticker) >= 10,
 which means the template repeated on at least 10 different days/instances.
-Grouping by event_ticker directly would misfire on single-day multimarket events
-(e.g. one day with 15 temperature threshold markets).
 
-Fixes in this version:
-  - Correct series key derivation (strip date suffix from event_ticker)
-  - Group by series_key, count DISTINCT events (not raw market rows)
-  - DuckDB CTEs + JOIN — no giant OR/IN strings
-  - Manifest records ONLY successful fetches (not errors/empty)
-  - Thread-local KalshiClient (one connection per thread)
-  - Conservative concurrency (MAX_WORKERS = 5)
-  - Safe sequential chunk naming with a counter + lock
+Crypto series included:
+  KXBTCD   - Daily BTC price markets (e.g. KXBTCD-26FEB0617)
+  KXBTCUP  - BTC Up or Down 15-minute / hourly markets
+  KXETH*   - Ethereum equivalent series
+  KXSOL*   - Solana equivalent series
+  etc.
 """
 
 import csv
@@ -55,11 +54,11 @@ MANIFEST      = Path("data/kalshi/.indexed_tickers.csv")
 TRADES_DIR.mkdir(parents=True, exist_ok=True)
 MANIFEST.parent.mkdir(parents=True, exist_ok=True)
 
-BATCH_SIZE        = 10_000
-MAX_WORKERS       = 2       # kalshi rate-limits aggressively; keep this low
-MIN_VOLUME        = 200     # skip very thin markets
-MIN_EVENT_INSTANCES = 10    # series must have recurred at least 10 times
-LIMIT             = 5_000   # total markets to index
+BATCH_SIZE          = 10_000
+MAX_WORKERS         = 2       # kalshi rate-limits aggressively; keep this low
+MIN_VOLUME          = 150     # skip very thin markets
+MIN_EVENT_INSTANCES = 10      # series must have recurred at least 10 times
+LIMIT               = 10_000   # total markets to index
 
 # ---------------------------------------------------------------------------
 # Thread-local KalshiClient — one persistent connection per worker thread
@@ -98,12 +97,19 @@ def select_recurring_markets(limit: int) -> list[str]:
     """
     Find the top `limit` markets from recurring series.
 
-    series_key is derived by stripping the date suffix from event_ticker:
-      KXHIGHNY-25JAN15  ->  KXHIGHNY
-      KXRAIN-25FEB01    ->  KXRAIN
+    series_key derivation (two-pass regex, applied in order):
 
-    We require COUNT(DISTINCT event_ticker) >= MIN_EVENT_INSTANCES per series,
-    meaning the same template ran on at least that many different days/instances.
+      Pass 1 — strip crypto hour suffix:
+        KXBTCD-26FEB0617   ->  KXBTCD
+        KXBTCUP-26FEB0613  ->  KXBTCUP
+        Pattern: -[0-9]{2}[A-Z]{3}[0-9]{4}$   (2 digits, 3 letters, 4 digits)
+
+      Pass 2 — strip standard date suffix:
+        KXHIGHNY-25JAN15   ->  KXHIGHNY
+        KXRAINNYC-26MAR01  ->  KXRAINNYC
+        Pattern: -[0-9]{2}[A-Z]{3}[0-9]{2}$   (2 digits, 3 letters, 2 digits)
+
+    We require COUNT(DISTINCT event_ticker) >= MIN_EVENT_INSTANCES per series.
     """
     print("Scanning markets catalog for recurring series...")
 
@@ -113,10 +119,15 @@ def select_recurring_markets(limit: int) -> list[str]:
                 ticker,
                 event_ticker,
                 volume,
-                -- Derive series key: strip trailing -DDMMMYY date suffix
-                -- e.g. KXHIGHNY-25JAN15 -> KXHIGHNY
+                -- Two-pass series key derivation:
+                -- Pass 1: strip -DDMMMDDYY (crypto with hour, e.g. -26FEB0617)
+                -- Pass 2: strip -DDMMMYY   (standard daily, e.g. -25JAN15)
                 REGEXP_REPLACE(
-                    event_ticker,
+                    REGEXP_REPLACE(
+                        event_ticker,
+                        '-[0-9]{{2}}[A-Z]{{3}}[0-9]{{4}}$',
+                        ''
+                    ),
                     '-[0-9]{{2}}[A-Z]{{3}}[0-9]{{2}}$',
                     ''
                 ) AS series_key
@@ -132,6 +143,9 @@ def select_recurring_markets(limit: int) -> list[str]:
                 COUNT(DISTINCT event_ticker) AS event_instances,
                 SUM(volume)                  AS total_volume
             FROM all_markets
+            -- Exclude markets where the suffix wasn't stripped
+            -- (series_key == event_ticker means no date suffix was found)
+            WHERE series_key != event_ticker
             GROUP BY series_key
             HAVING COUNT(DISTINCT event_ticker) >= {MIN_EVENT_INSTANCES}
         ),
@@ -160,13 +174,20 @@ def select_recurring_markets(limit: int) -> list[str]:
 
 def print_series_breakdown(tickers: list[str]) -> None:
     """Print a preview of top series in the selected universe."""
-    # Sample first 500 for speed
     sample = tickers[:500]
     ticker_list = ", ".join(f"'{t}'" for t in sample)
 
     rows = duckdb.sql(f"""
         SELECT
-            REGEXP_REPLACE(event_ticker, '-[0-9]{{2}}[A-Z]{{3}}[0-9]{{2}}$', '') AS series_key,
+            REGEXP_REPLACE(
+                REGEXP_REPLACE(
+                    event_ticker,
+                    '-[0-9]{{2}}[A-Z]{{3}}[0-9]{{4}}$',
+                    ''
+                ),
+                '-[0-9]{{2}}[A-Z]{{3}}[0-9]{{2}}$',
+                ''
+            ) AS series_key,
             COUNT(DISTINCT event_ticker) AS events,
             COUNT(*)                     AS markets,
             SUM(volume)                  AS total_vol
@@ -265,65 +286,36 @@ def main() -> None:
         print("All done — nothing to fetch.")
         return
 
-    buffer:        list[dict] = []
-    total_saved                = 0
-    newly_indexed: list[str]  = []   # only confirmed successes
-    errors:        list[str]  = []
+    trades_batch: list[dict] = []
+    success_tickers: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_ticker, t): t for t in to_fetch}
-        pbar = tqdm(total=len(to_fetch), desc="Fetching", unit="market")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(fetch_ticker, t): t for t in to_fetch}
+        with tqdm(total=len(to_fetch), unit="market") as bar:
+            for future in as_completed(futures):
+                result: FetchResult = future.result()
+                bar.update(1)
 
-        for future in as_completed(futures):
-            result: FetchResult = future.result()
+                if not result.success:
+                    bar.write(f"  ERROR {result.ticker}: {result.error}")
+                    continue
 
-            if result.success:
-                if result.trades:
-                    buffer.extend(result.trades)
-                # Mark done ONLY on success (even if 0 trades — market just had none)
-                newly_indexed.append(result.ticker)
-            else:
-                errors.append(result.ticker)
-                tqdm.write(f"  [ERROR] {result.ticker}: {result.error}")
+                trades_batch.extend(result.trades)
+                success_tickers.append(result.ticker)
 
-            pbar.update(1)
-            pbar.set_postfix(
-                buffered=len(buffer),
-                saved=total_saved,
-                errors=len(errors),
-            )
+                if len(trades_batch) >= BATCH_SIZE:
+                    save_batch(trades_batch)
+                    append_manifest(success_tickers)
+                    trades_batch = []
+                    success_tickers = []
 
-            # Flush buffer to disk
-            while len(buffer) >= BATCH_SIZE:
-                save_batch(buffer[:BATCH_SIZE])
-                total_saved += BATCH_SIZE
-                buffer = buffer[BATCH_SIZE:]
+    # Flush remainder
+    if trades_batch:
+        save_batch(trades_batch)
+    if success_tickers:
+        append_manifest(success_tickers)
 
-            # Checkpoint manifest every 100 successes
-            if len(newly_indexed) >= 100:
-                append_manifest(newly_indexed)
-                newly_indexed.clear()
-
-        pbar.close()
-
-    # Final flush
-    if buffer:
-        save_batch(buffer)
-        total_saved += len(buffer)
-
-    if newly_indexed:
-        append_manifest(newly_indexed)
-
-    print(f"\n{'='*50}")
-    print(f"Done!")
-    print(f"  Trades saved : {total_saved:,}")
-    print(f"  Succeeded    : {len(to_fetch) - len(errors):,}")
-    print(f"  Errors       : {len(errors):,}  (will retry on next run)")
-    if errors:
-        print(f"  Failed tickers saved to: data/kalshi/.failed_tickers.txt")
-        Path("data/kalshi/.failed_tickers.txt").write_text("\n".join(errors))
-    print(f"  Manifest : {MANIFEST}")
-    print(f"  Trades   : {TRADES_DIR}")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
