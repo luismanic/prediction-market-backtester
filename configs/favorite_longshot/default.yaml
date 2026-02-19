@@ -1,0 +1,5 @@
+strategy_name: favorite_longshot
+strategy_params:
+  longshot_threshold: 0.15
+  favorite_threshold: 0.80
+  qty: 5.0

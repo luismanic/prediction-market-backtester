@@ -33,7 +33,7 @@ from pm_bt.scanner import (
     write_alerts_html,
     write_alerts_json,
 )
-from pm_bt.strategies import EventThresholdStrategy, MeanReversionStrategy, MomentumStrategy
+from pm_bt.strategies import EventThresholdStrategy, MeanReversionStrategy, MomentumStrategy, FavoriteLongshotStrategy
 from pm_bt.strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
@@ -53,12 +53,14 @@ _STRATEGY_REGISTRY: dict[str, StrategyFactory] = {
     "momentum": MomentumStrategy,
     "mean_reversion": MeanReversionStrategy,
     "event_threshold": EventThresholdStrategy,
+    "favorite_longshot": FavoriteLongshotStrategy,
 }
 
 _DEFAULT_CONFIG_PATHS: dict[str, Path] = {
     "momentum": Path("configs/momentum/default.yaml"),
     "mean_reversion": Path("configs/mean_reversion/default.yaml"),
     "event_threshold": Path("configs/event_threshold/default.yaml"),
+    "favorite_longshot": Path("configs/favorite_longshot/default.yaml"),
 }
 
 
@@ -183,6 +185,7 @@ def _persist_single_run(
     run_dir: Path | None,
     *,
     argv_run: bool,
+    skip_plots: bool = False,
 ) -> RunPersistencePayload:
     strategy = _build_strategy(config.strategy_name, config.strategy_params)
     artifacts = BacktestEngine(config=config, strategy=strategy).run()
@@ -203,7 +206,7 @@ def _persist_single_run(
     }
 
     reporting_t0 = perf_counter()
-    extra_metrics, report_artifacts = generate_report(artifacts, run_dir, config.bar_timeframe)
+    extra_metrics, report_artifacts = generate_report(artifacts, run_dir, config.bar_timeframe, skip_plots=skip_plots)
     forecasting_metrics = _compute_forecasting_metrics(config, artifacts.fills)
     artifacts.run_result.timings.reporting_s = perf_counter() - reporting_t0
 
@@ -415,7 +418,7 @@ def _run_batch(args: argparse.Namespace) -> int:
                         market_id=market_id,
                     )
                     run_dir = runs_dir / make_run_id()
-                    run_payload = _persist_single_run(config, run_dir, argv_run=False)
+                    run_payload = _persist_single_run(config, run_dir, argv_run=False, skip_plots=cast(bool, getattr(args, "no_plots", False)))
                     summary_row: dict[str, object] = {
                         "venue": venue.value,
                         "market_id": market_id,
@@ -573,6 +576,7 @@ def build_parser() -> argparse.ArgumentParser:
     _ = batch.add_argument("--max-null-rate", type=float, default=0.01)
     _ = batch.add_argument("--max-gap-minutes", type=float, default=720.0)
     _ = batch.add_argument("--resume", action="store_true")
+    _ = batch.add_argument("--no-plots", action="store_true", default=False, help="Skip per-market plots")  # ← ADD THIS
     _ = batch.set_defaults(handler=_run_batch)
 
     scan = subparsers.add_parser("scan", help="Run alpha scanner and produce alerts")

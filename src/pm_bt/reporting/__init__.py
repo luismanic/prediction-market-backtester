@@ -43,6 +43,7 @@ def generate_report(
     artifacts: BacktestArtifacts,
     output_dir: Path,
     bar_timeframe: str,
+    skip_plots: bool = False,
 ) -> tuple[dict[str, float], dict[str, str]]:
     """Generate all reporting artifacts and return extra metrics + artifact paths.
 
@@ -71,17 +72,18 @@ def generate_report(
     artifact_paths["config_json"] = str(config_path)
 
     # -- Plots --
-    equity_plot_path = output_dir / "equity_curve.png"
-    plot_equity_curve(artifacts.equity_curve, equity_plot_path)
-    artifact_paths["equity_curve_png"] = str(equity_plot_path)
+    if not skip_plots:
+        equity_plot_path = output_dir / "equity_curve.png"
+        plot_equity_curve(artifacts.equity_curve, equity_plot_path)
+        artifact_paths["equity_curve_png"] = str(equity_plot_path)
 
-    drawdown_plot_path = output_dir / "drawdown.png"
-    plot_drawdown(artifacts.equity_curve, drawdown_plot_path)
-    artifact_paths["drawdown_png"] = str(drawdown_plot_path)
+        drawdown_plot_path = output_dir / "drawdown.png"
+        plot_drawdown(artifacts.equity_curve, drawdown_plot_path)
+        artifact_paths["drawdown_png"] = str(drawdown_plot_path)
 
-    returns_plot_path = output_dir / "returns_distribution.png"
-    plot_returns_distribution(artifacts.equity_curve, returns_plot_path)
-    artifact_paths["returns_distribution_png"] = str(returns_plot_path)
+        returns_plot_path = output_dir / "returns_distribution.png"
+        plot_returns_distribution(artifacts.equity_curve, returns_plot_path)
+        artifact_paths["returns_distribution_png"] = str(returns_plot_path)
 
     logger.info(
         "Report generated: %d extra metrics, %d artifacts", len(extra_metrics), len(artifact_paths)
