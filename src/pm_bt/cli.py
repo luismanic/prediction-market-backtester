@@ -174,65 +174,71 @@ def _compute_forecasting_metrics(config: BacktestConfig, fills: pl.DataFrame) ->
             start_ts=config.start_ts,
             end_ts=config.end_ts,
         ).collect()
-    except FileNotFoundError:
-        logger.warning("Market metadata not found; forecasting metrics skipped")
+    except Exception:  # noqa: BLE001
         return {}
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to load markets for forecasting metrics: %s", exc)
-        return {}
-    return compute_calibration_metrics_from_fills_and_markets(fills, markets)
+    return compute_calibration_metrics_from_fills_and_markets(fills=fills, markets=markets)
 
+
+# ---------------------------------------------------------------------------
+# Single-run persistence
+# ---------------------------------------------------------------------------
 
 def _persist_single_run(
     config: BacktestConfig,
     run_dir: Path | None,
     *,
-    argv_run: bool,
+    argv_run: bool = False,
     skip_plots: bool = False,
 ) -> RunPersistencePayload:
-    strategy = _build_strategy(config.strategy_name, config.strategy_params)
-    artifacts = BacktestEngine(config=config, strategy=strategy).run()
+    _ = perf_counter()
 
-    resolved_run_dir = run_dir or (config.output_root / artifacts.run_result.run_id)
-    run_dir = resolved_run_dir
-    safe_mkdir(run_dir)
-    results_path = run_dir / "results.json"
-    equity_path = run_dir / "equity.csv"
-    trades_path = run_dir / "trades.csv"
-
-    artifacts.equity_curve.write_csv(equity_path)
-    artifacts.fills.write_csv(trades_path)
-    artifacts.run_result.artifacts = {
-        "results_json": str(results_path),
-        "equity_csv": str(equity_path),
-        "trades_csv": str(trades_path),
-    }
-
-    reporting_t0 = perf_counter()
-    extra_metrics, report_artifacts = generate_report(
-        artifacts, run_dir, config.bar_timeframe, skip_plots=skip_plots
+    # Build strategy from config fields — BacktestConfig holds name+params, not an instance
+    strategy_name = cast(str, config.strategy_name)
+    strategy_params = _as_str_object_mapping(
+        config.strategy_params, field_name="strategy_params"
     )
-    forecasting_metrics = _compute_forecasting_metrics(config, artifacts.fills)
-    artifacts.run_result.timings.reporting_s = perf_counter() - reporting_t0
+    strategy = _build_strategy(strategy_name, strategy_params)
 
-    artifacts.run_result.trading_metrics.update(extra_metrics)
-    artifacts.run_result.forecasting_metrics.update(forecasting_metrics)
-    artifacts.run_result.artifacts.update(report_artifacts)
+    engine = BacktestEngine(config=config, strategy=strategy)
+    artifacts = engine.run()
 
-    results_payload = artifacts.run_result.model_dump(mode="json")
-    _ = results_path.write_text(
-        json.dumps(results_payload, indent=2, sort_keys=True),
+    if run_dir is None:
+        output_root = config.output_root
+        safe_mkdir(output_root)
+        run_dir = output_root / artifacts.run_result.run_id
+    safe_mkdir(run_dir)
+
+    results_path = run_dir / "results.json"
+    results_path.write_text(
+        json.dumps(
+            {
+                "run_id": artifacts.run_result.run_id,
+                "trading_metrics": artifacts.run_result.trading_metrics,
+                "forecasting_metrics": artifacts.run_result.forecasting_metrics,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
-    if argv_run:
-        logger.info("Backtest completed. Artifacts written to %s", run_dir)
-    return {
-        "run_id": artifacts.run_result.run_id,
-        "run_dir": str(run_dir),
-        "results_path": str(results_path),
-        "trading_metrics": artifacts.run_result.trading_metrics,
-        "forecasting_metrics": artifacts.run_result.forecasting_metrics,
-    }
+
+    artifacts.equity_curve.write_csv(run_dir / "equity.csv")
+    artifacts.fills.write_csv(run_dir / "trades.csv")
+
+    if not skip_plots:
+        try:
+            generate_report(artifacts, run_dir)
+        except Exception:  # noqa: BLE001
+            pass
+
+    logger.debug("Artifacts written to %s", run_dir)
+    return RunPersistencePayload(
+        run_id=artifacts.run_result.run_id,
+        run_dir=str(run_dir),
+        results_path=str(results_path),
+        trading_metrics=artifacts.run_result.trading_metrics,
+        forecasting_metrics=artifacts.run_result.forecasting_metrics,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +440,31 @@ def _resolve_batch_dir(*, output_root: Path, batch_name: str, resume: bool) -> P
     return output_root / f"{batch_name}_{make_run_id()}"
 
 
+def _handle_entry_logging(
+    entry: dict[str, object],
+    venue_str: str,
+    market_id: str,
+) -> None:
+    """Log the outcome of a single market batch entry."""
+    status = cast(str, entry.get("status", "unknown"))
+    if status == "skipped_quality":
+        logger.warning(
+            "Skipping %s/%s due to quality gate: %s",
+            venue_str,
+            market_id,
+            cast(dict, entry.get("quality", {})).get("failed_checks", ""),
+        )
+    elif status == "completed":
+        logger.info("Batch completed market %s/%s", venue_str, market_id)
+    else:
+        logger.error(
+            "Batch market failed: %s/%s — %s",
+            venue_str,
+            market_id,
+            entry.get("error", ""),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main batch runner
 # ---------------------------------------------------------------------------
@@ -521,21 +552,14 @@ def _run_batch(args: argparse.Namespace) -> int:
             run_name=run_name,
         )
 
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _process_one_market,
-                    venue_str,
-                    market_id,
-                    **worker_kwargs,
-                ): (venue_str, market_id)
-                for venue_str, market_id in markets_to_run
-            }
-
-            for future in as_completed(futures):
-                venue_str, market_id = futures[future]
+        if workers == 1:
+            # ------------------------------------------------------------------
+            # Sequential mode — run directly in the main process.
+            # Avoids Windows ProcessPoolExecutor spawn overhead and hangs.
+            # ------------------------------------------------------------------
+            for venue_str, market_id in markets_to_run:
                 try:
-                    entry = future.result()
+                    entry = _process_one_market(venue_str, market_id, **worker_kwargs)
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Worker crashed for %s/%s", venue_str, market_id)
                     entry = {
@@ -544,28 +568,41 @@ def _run_batch(args: argparse.Namespace) -> int:
                         "status": "failed",
                         "error": str(exc),
                     }
-
-                status = cast(str, entry.get("status", "unknown"))
-                if status == "skipped_quality":
-                    logger.warning(
-                        "Skipping %s/%s due to quality gate: %s",
-                        venue_str,
-                        market_id,
-                        cast(dict, entry.get("quality", {})).get("failed_checks", ""),
-                    )
-                elif status == "completed":
-                    logger.info("Batch completed market %s/%s", venue_str, market_id)
-                else:
-                    logger.error(
-                        "Batch market failed: %s/%s — %s",
-                        venue_str,
-                        market_id,
-                        entry.get("error", ""),
-                    )
-
+                _handle_entry_logging(entry, venue_str, market_id)
                 all_entries.append(entry)
                 _write_batch_checkpoint(checkpoint_path, all_entries)
                 processed.add((venue_str, market_id))
+        else:
+            # ------------------------------------------------------------------
+            # Parallel mode — use ProcessPoolExecutor for workers > 1.
+            # ------------------------------------------------------------------
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        _process_one_market,
+                        venue_str,
+                        market_id,
+                        **worker_kwargs,
+                    ): (venue_str, market_id)
+                    for venue_str, market_id in markets_to_run
+                }
+
+                for future in as_completed(futures):
+                    venue_str, market_id = futures[future]
+                    try:
+                        entry = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("Worker crashed for %s/%s", venue_str, market_id)
+                        entry = {
+                            "venue": venue_str,
+                            "market_id": market_id,
+                            "status": "failed",
+                            "error": str(exc),
+                        }
+                    _handle_entry_logging(entry, venue_str, market_id)
+                    all_entries.append(entry)
+                    _write_batch_checkpoint(checkpoint_path, all_entries)
+                    processed.add((venue_str, market_id))
 
         # Write summary.csv
         summary_rows = [
@@ -595,69 +632,27 @@ def _run_batch(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
 
-        logger.info("Batch complete. Summary: %s", summary_path)
+        logger.info("Batch complete. Results written to %s", batch_dir)
         return 0
+
     except Exception as exc:  # noqa: BLE001
         logger.exception("Batch failed: %s", exc)
         return 1
 
 
 # ---------------------------------------------------------------------------
-# Scanner
+# Scan runner
 # ---------------------------------------------------------------------------
-
-def _build_scan_config(args: argparse.Namespace) -> ScannerConfig:
-    config_path = cast(str | None, getattr(args, "config", None))
-    config_data: dict[str, object] = {}
-    if config_path:
-        config_data = _load_yaml_config(Path(config_path))
-
-    config_data["data_root"] = Path(cast(str, args.data_root))
-    config_data["output_dir"] = Path(cast(str, args.output_dir))
-
-    raw_venues = cast(list[str] | None, getattr(args, "venues", None))
-    if raw_venues:
-        config_data["venues"] = [Venue(v) for v in raw_venues]
-
-    raw_market_ids = cast(list[str] | None, getattr(args, "market_ids", None))
-    if raw_market_ids:
-        config_data["market_ids"] = raw_market_ids
-
-    start_ts = cast(str | None, getattr(args, "start_ts", None))
-    end_ts = cast(str | None, getattr(args, "end_ts", None))
-    if start_ts:
-        config_data["start_ts"] = parse_ts_utc(start_ts)
-    if end_ts:
-        config_data["end_ts"] = parse_ts_utc(end_ts)
-
-    for cli_key in (
-        "top_n",
-        "complement_sum_tolerance",
-        "mutually_exclusive_tolerance",
-        "whale_rolling_window",
-        "whale_size_multiplier",
-        "impact_score_threshold",
-    ):
-        val = getattr(args, cli_key, None)
-        if val is not None:
-            config_data[cli_key] = val
-
-    if getattr(args, "emit_html", False):
-        config_data["emit_html"] = True
-
-    return ScannerConfig.model_validate(config_data)
-
 
 def _run_scan(args: argparse.Namespace) -> int:
     try:
-        config = _build_scan_config(args)
-        safe_mkdir(config.output_dir)
+        config_path = Path(cast(str, args.config))
+        config = ScannerConfig.from_yaml(config_path)
         alerts = run_scanner(config)
-        write_alerts_json(alerts, config.output_dir / "alerts.json")
-        write_alerts_csv(alerts, config.output_dir / "alerts.csv")
-        if config.emit_html:
-            write_alerts_html(alerts, config.output_dir / "alerts.html")
-        logger.info("Scan complete. %d alert(s) written to %s", len(alerts), config.output_dir)
+        write_alerts_json(alerts, config.output_dir)
+        write_alerts_csv(alerts, config.output_dir)
+        write_alerts_html(alerts, config.output_dir)
+        logger.info("%d alert(s) written to %s", len(alerts), config.output_dir)
         return 0
     except Exception as exc:  # noqa: BLE001
         logger.exception("Scan failed: %s", exc)
@@ -711,27 +706,13 @@ def build_parser() -> argparse.ArgumentParser:
     # -- scan --
     scan = subparsers.add_parser("scan", help="Run alpha scanner and produce alerts")
     _ = scan.add_argument("--config", required=False)
-    _ = scan.add_argument("--data-root", default="data")
-    _ = scan.add_argument("--output-dir", default="output/scans")
-    _ = scan.add_argument("--venues", nargs="+", choices=[v.value for v in Venue])
-    _ = scan.add_argument("--market-ids", nargs="+")
-    _ = scan.add_argument("--top-n", type=int, dest="top_n")
-    _ = scan.add_argument("--start-ts", required=False)
-    _ = scan.add_argument("--end-ts", required=False)
-    _ = scan.add_argument("--complement-sum-tolerance", type=float, dest="complement_sum_tolerance")
-    _ = scan.add_argument(
-        "--mutually-exclusive-tolerance", type=float, dest="mutually_exclusive_tolerance"
-    )
-    _ = scan.add_argument("--whale-rolling-window", type=str, dest="whale_rolling_window")
-    _ = scan.add_argument("--whale-size-multiplier", type=float, dest="whale_size_multiplier")
-    _ = scan.add_argument("--impact-score-threshold", type=float, dest="impact_score_threshold")
-    _ = scan.add_argument("--emit-html", action="store_true")
     _ = scan.set_defaults(handler=_run_scan)
 
     return parser
 
 
 def run_cli(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = build_parser()
     args = parser.parse_args(argv)
     handler = cast(Callable[[argparse.Namespace], int], args.handler)
@@ -739,6 +720,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     raise SystemExit(run_cli())
-    
+
+
+if __name__ == "__main__":
+    main()
