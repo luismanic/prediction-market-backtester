@@ -29,6 +29,7 @@ Crypto series included:
 import csv
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
@@ -58,7 +59,7 @@ BATCH_SIZE          = 10_000
 MAX_WORKERS         = 2       # kalshi rate-limits aggressively; keep this low
 MIN_VOLUME          = 150     # skip very thin markets
 MIN_EVENT_INSTANCES = 10      # series must have recurred at least 10 times
-LIMIT               = 10_000   # total markets to index
+LIMIT               = 80_000   # total markets to index
 
 # ---------------------------------------------------------------------------
 # Thread-local KalshiClient — one persistent connection per worker thread
@@ -215,11 +216,7 @@ class FetchResult(NamedTuple):
     error: str      # empty string on success
 
 def fetch_ticker(ticker: str) -> FetchResult:
-    """
-    Fetch all trades for a ticker.
-    Returns success=False on any exception so the ticker is NOT added to the
-    manifest and will be retried on the next run.
-    """
+    time.sleep(0.35)
     client = get_client()
     try:
         trades = client.get_market_trades(ticker, verbose=False)

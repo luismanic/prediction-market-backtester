@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -33,7 +34,8 @@ from pm_bt.scanner import (
     write_alerts_html,
     write_alerts_json,
 )
-from pm_bt.strategies import EventThresholdStrategy, MeanReversionStrategy, MomentumStrategy, FavoriteLongshotStrategy
+from pm_bt.strategies import EventThresholdStrategy, MeanReversionStrategy, MomentumStrategy
+from pm_bt.strategies.favorite_longshot import FavoriteLongshotStrategy
 from pm_bt.strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
@@ -64,12 +66,15 @@ _DEFAULT_CONFIG_PATHS: dict[str, Path] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _as_str_object_mapping(value: object, *, field_name: str) -> dict[str, object]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
         raise ValueError(f"{field_name} must be a mapping")
-
     mapping = cast(Mapping[object, object], value)
     output: dict[str, object] = {}
     for key, mapped_value in mapping.items():
@@ -90,7 +95,6 @@ def _resolve_config_path(args: argparse.Namespace) -> Path:
     explicit = cast(str | None, getattr(args, "config", None))
     if explicit:
         return Path(explicit)
-
     strategy_name = cast(str, args.strategy)
     default_path = _DEFAULT_CONFIG_PATHS.get(strategy_name)
     if default_path is None:
@@ -140,7 +144,6 @@ def _build_backtest_config(
     args: argparse.Namespace,
     yaml_config: Mapping[str, object],
 ) -> BacktestConfig:
-    """Build BacktestConfig from YAML + CLI (CLI arguments take precedence)."""
     config_data = _apply_cli_overrides(config_data=dict(yaml_config), args=args)
     config_data["venue"] = Venue(cast(str, args.venue))
     config_data["market_id"] = cast(str, args.market)
@@ -206,7 +209,9 @@ def _persist_single_run(
     }
 
     reporting_t0 = perf_counter()
-    extra_metrics, report_artifacts = generate_report(artifacts, run_dir, config.bar_timeframe, skip_plots=skip_plots)
+    extra_metrics, report_artifacts = generate_report(
+        artifacts, run_dir, config.bar_timeframe, skip_plots=skip_plots
+    )
     forecasting_metrics = _compute_forecasting_metrics(config, artifacts.fills)
     artifacts.run_result.timings.reporting_s = perf_counter() - reporting_t0
 
@@ -229,6 +234,132 @@ def _persist_single_run(
         "forecasting_metrics": artifacts.run_result.forecasting_metrics,
     }
 
+
+# ---------------------------------------------------------------------------
+# Top-level worker function for ProcessPoolExecutor (must NOT be nested)
+# ---------------------------------------------------------------------------
+
+def _process_one_market(
+    venue_str: str,
+    market_id: str,
+    data_root_str: str,
+    runs_dir_str: str,
+    checkpoint_path_str: str,
+    yaml_config: dict[str, object],
+    min_trades: int,
+    max_null_rate: float,
+    max_gap_minutes: float,
+    start_ts: datetime | None,
+    end_ts: datetime | None,
+    strategy_name: str,
+    bar_timeframe: str,
+    skip_plots: bool,
+    output_root_str: str,
+    run_name: str,
+) -> dict[str, object]:
+    """
+    Worker function — runs in a separate process for each market.
+    Returns a checkpoint_entry dict. All Path objects are passed as strings
+    because Path objects are not always picklable across processes.
+    """
+    venue = Venue(venue_str)
+    data_root = Path(data_root_str)
+    runs_dir = Path(runs_dir_str)
+
+    quality_payload: dict[str, object] = {}
+
+    # Load trades
+    try:
+        trades_df = load_trades(
+            venue,
+            data_root=data_root,
+            market_id=market_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        ).collect()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "venue": venue_str,
+            "market_id": market_id,
+            "status": "failed",
+            "error": str(exc),
+        }
+
+    # Quality gate
+    quality = evaluate_market_trade_quality(
+        trades_df,
+        venue=venue_str,
+        market_id=market_id,
+        min_trade_count=min_trades,
+        max_null_rate=max_null_rate,
+        max_gap_minutes=max_gap_minutes,
+    )
+    quality_payload = quality.as_dict()
+
+    if not quality.passes:
+        return {
+            "venue": venue_str,
+            "market_id": market_id,
+            "status": "skipped_quality",
+            "quality": quality_payload,
+        }
+
+    # Build config and run backtest
+    try:
+        config = BacktestConfig.model_validate({
+            "strategy_name": strategy_name,
+            "strategy_params": _as_str_object_mapping(
+                yaml_config.get("strategy_params"), field_name="strategy_params"
+            ),
+            "venue": venue,
+            "market_id": market_id,
+            "data_root": data_root,
+            "output_root": Path(output_root_str),
+            "name": run_name,
+            "bar_timeframe": bar_timeframe,
+            **{
+                k: v for k, v in yaml_config.items()
+                if k not in ("strategy_name", "strategy_params")
+            },
+        })
+
+        run_dir = runs_dir / make_run_id()
+        run_payload = _persist_single_run(
+            config, run_dir, argv_run=False, skip_plots=skip_plots
+        )
+
+        summary_row: dict[str, object] = {
+            "venue": venue_str,
+            "market_id": market_id,
+            "status": "completed",
+            "run_id": run_payload["run_id"],
+            "results_json": run_payload["results_path"],
+        }
+        summary_row.update(run_payload["trading_metrics"])
+        summary_row.update(run_payload["forecasting_metrics"])
+        summary_row.update(compute_tradability_metrics(trades_df))
+
+        return {
+            "venue": venue_str,
+            "market_id": market_id,
+            "status": "completed",
+            "quality": quality_payload,
+            "summary": summary_row,
+        }
+
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "venue": venue_str,
+            "market_id": market_id,
+            "status": "failed",
+            "quality": quality_payload,
+            "error": str(exc),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Batch helpers
+# ---------------------------------------------------------------------------
 
 def _run_backtest(args: argparse.Namespace) -> int:
     try:
@@ -303,6 +434,10 @@ def _resolve_batch_dir(*, output_root: Path, batch_name: str, resume: bool) -> P
     return output_root / f"{batch_name}_{make_run_id()}"
 
 
+# ---------------------------------------------------------------------------
+# Main batch runner
+# ---------------------------------------------------------------------------
+
 def _run_batch(args: argparse.Namespace) -> int:
     try:
         config_path = _resolve_config_path(args)
@@ -341,7 +476,14 @@ def _run_batch(args: argparse.Namespace) -> int:
             parse_ts_utc(cast(str, args.start_ts)) if getattr(args, "start_ts", None) else None
         )
         end_ts = parse_ts_utc(cast(str, args.end_ts)) if getattr(args, "end_ts", None) else None
+        workers = int(cast(int, getattr(args, "workers", 1)))
+        skip_plots = cast(bool, getattr(args, "no_plots", False))
+        bar_timeframe = cast(str | None, getattr(args, "bar_timeframe", None)) or "1h"
+        strategy_name = cast(str, args.strategy)
+        run_name = cast(str | None, args.name) or "batch"
 
+        # Build list of markets to process
+        markets_to_run: list[tuple[str, str]] = []
         for venue in venues:
             try:
                 markets = _top_markets_by_volume(
@@ -354,104 +496,78 @@ def _run_batch(args: argparse.Namespace) -> int:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Skipping venue %s: unable to rank markets (%s)", venue.value, exc)
                 continue
-
             for market_id in markets:
                 key = (venue.value, market_id)
-                if key in processed:
-                    continue
+                if key not in processed:
+                    markets_to_run.append((venue.value, market_id))
 
+        logger.info("Markets to process: %d (workers=%d)", len(markets_to_run), workers)
+
+        # Shared kwargs passed to every worker
+        worker_kwargs = dict(
+            data_root_str=str(data_root),
+            runs_dir_str=str(runs_dir),
+            checkpoint_path_str=str(checkpoint_path),
+            yaml_config=dict(yaml_config),
+            min_trades=min_trades,
+            max_null_rate=max_null_rate,
+            max_gap_minutes=max_gap_minutes,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            strategy_name=strategy_name,
+            bar_timeframe=bar_timeframe,
+            skip_plots=skip_plots,
+            output_root_str=str(output_root),
+            run_name=run_name,
+        )
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _process_one_market,
+                    venue_str,
+                    market_id,
+                    **worker_kwargs,
+                ): (venue_str, market_id)
+                for venue_str, market_id in markets_to_run
+            }
+
+            for future in as_completed(futures):
+                venue_str, market_id = futures[future]
                 try:
-                    trades_df = load_trades(
-                        venue,
-                        data_root=data_root,
-                        market_id=market_id,
-                        start_ts=start_ts,
-                        end_ts=end_ts,
-                    ).collect()
+                    entry = future.result()
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Skipping %s/%s: failed to load trades (%s)", venue.value, market_id, exc
-                    )
-                    checkpoint_entry: dict[str, object] = {
-                        "venue": venue.value,
+                    logger.exception("Worker crashed for %s/%s", venue_str, market_id)
+                    entry = {
+                        "venue": venue_str,
                         "market_id": market_id,
                         "status": "failed",
                         "error": str(exc),
                     }
-                    all_entries.append(checkpoint_entry)
-                    _write_batch_checkpoint(checkpoint_path, all_entries)
-                    processed.add(key)
-                    continue
 
-                quality = evaluate_market_trade_quality(
-                    trades_df,
-                    venue=venue.value,
-                    market_id=market_id,
-                    min_trade_count=min_trades,
-                    max_null_rate=max_null_rate,
-                    max_gap_minutes=max_gap_minutes,
-                )
-                quality_payload = quality.as_dict()
-                if not quality.passes:
+                status = cast(str, entry.get("status", "unknown"))
+                if status == "skipped_quality":
                     logger.warning(
                         "Skipping %s/%s due to quality gate: %s",
-                        venue.value,
+                        venue_str,
                         market_id,
-                        ",".join(quality.failed_checks),
+                        cast(dict, entry.get("quality", {})).get("failed_checks", ""),
                     )
-                    checkpoint_entry = {
-                        "venue": venue.value,
-                        "market_id": market_id,
-                        "status": "skipped_quality",
-                        "quality": quality_payload,
-                    }
-                    all_entries.append(checkpoint_entry)
-                    _write_batch_checkpoint(checkpoint_path, all_entries)
-                    processed.add(key)
-                    continue
-
-                try:
-                    config = _build_market_batch_config(
-                        args=args,
-                        yaml_config=yaml_config,
-                        venue=venue,
-                        market_id=market_id,
+                elif status == "completed":
+                    logger.info("Batch completed market %s/%s", venue_str, market_id)
+                else:
+                    logger.error(
+                        "Batch market failed: %s/%s — %s",
+                        venue_str,
+                        market_id,
+                        entry.get("error", ""),
                     )
-                    run_dir = runs_dir / make_run_id()
-                    run_payload = _persist_single_run(config, run_dir, argv_run=False, skip_plots=cast(bool, getattr(args, "no_plots", False)))
-                    summary_row: dict[str, object] = {
-                        "venue": venue.value,
-                        "market_id": market_id,
-                        "status": "completed",
-                        "run_id": run_payload["run_id"],
-                        "results_json": run_payload["results_path"],
-                    }
-                    summary_row.update(run_payload["trading_metrics"])
-                    summary_row.update(run_payload["forecasting_metrics"])
-                    summary_row.update(compute_tradability_metrics(trades_df))
 
-                    checkpoint_entry = {
-                        "venue": venue.value,
-                        "market_id": market_id,
-                        "status": "completed",
-                        "quality": quality_payload,
-                        "summary": summary_row,
-                    }
-                    logger.info("Batch completed market %s/%s", venue.value, market_id)
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Batch market failed: %s/%s", venue.value, market_id)
-                    checkpoint_entry = {
-                        "venue": venue.value,
-                        "market_id": market_id,
-                        "status": "failed",
-                        "quality": quality_payload,
-                        "error": str(exc),
-                    }
-
-                all_entries.append(checkpoint_entry)
+                all_entries.append(entry)
                 _write_batch_checkpoint(checkpoint_path, all_entries)
-                processed.add(key)
+                processed.add((venue_str, market_id))
 
+        # Write summary.csv
         summary_rows = [
             cast(dict[str, object], entry["summary"])
             for entry in all_entries
@@ -469,7 +585,9 @@ def _run_batch(args: argparse.Namespace) -> int:
             )
 
         quality_rows = [
-            cast(dict[str, object], entry["quality"]) for entry in all_entries if "quality" in entry
+            cast(dict[str, object], entry["quality"])
+            for entry in all_entries
+            if "quality" in entry
         ]
         quality_path = batch_dir / "data_quality.json"
         _ = quality_path.write_text(
@@ -484,8 +602,11 @@ def _run_batch(args: argparse.Namespace) -> int:
         return 1
 
 
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
+
 def _build_scan_config(args: argparse.Namespace) -> ScannerConfig:
-    """Build ScannerConfig from CLI args + optional YAML config file."""
     config_path = cast(str | None, getattr(args, "config", None))
     config_data: dict[str, object] = {}
     if config_path:
@@ -528,7 +649,6 @@ def _build_scan_config(args: argparse.Namespace) -> ScannerConfig:
 
 
 def _run_scan(args: argparse.Namespace) -> int:
-    """Handler for ``pm-bt scan``."""
     try:
         config = _build_scan_config(args)
         safe_mkdir(config.output_dir)
@@ -544,10 +664,15 @@ def _run_scan(args: argparse.Namespace) -> int:
         return 1
 
 
+# ---------------------------------------------------------------------------
+# CLI parser
+# ---------------------------------------------------------------------------
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pm-bt")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # -- backtest --
     backtest = subparsers.add_parser("backtest", help="Run a backtest and persist run artifacts")
     _ = backtest.add_argument("--venue", choices=[venue.value for venue in Venue], required=True)
     _ = backtest.add_argument("--market", required=True)
@@ -561,6 +686,7 @@ def build_parser() -> argparse.ArgumentParser:
     _ = backtest.add_argument("--bar-timeframe", required=False)
     _ = backtest.set_defaults(handler=_run_backtest)
 
+    # -- batch --
     batch = subparsers.add_parser("batch", help="Run strategy over top-N markets per venue")
     _ = batch.add_argument("--strategy", required=True)
     _ = batch.add_argument("--config", required=False)
@@ -576,9 +702,13 @@ def build_parser() -> argparse.ArgumentParser:
     _ = batch.add_argument("--max-null-rate", type=float, default=0.01)
     _ = batch.add_argument("--max-gap-minutes", type=float, default=720.0)
     _ = batch.add_argument("--resume", action="store_true")
-    _ = batch.add_argument("--no-plots", action="store_true", default=False, help="Skip per-market plots")  # ← ADD THIS
+    _ = batch.add_argument("--no-plots", action="store_true", default=False,
+                           help="Skip per-market plot generation")
+    _ = batch.add_argument("--workers", type=int, default=1,
+                           help="Number of parallel worker processes (default 1)")
     _ = batch.set_defaults(handler=_run_batch)
 
+    # -- scan --
     scan = subparsers.add_parser("scan", help="Run alpha scanner and produce alerts")
     _ = scan.add_argument("--config", required=False)
     _ = scan.add_argument("--data-root", default="data")
@@ -597,6 +727,7 @@ def build_parser() -> argparse.ArgumentParser:
     _ = scan.add_argument("--impact-score-threshold", type=float, dest="impact_score_threshold")
     _ = scan.add_argument("--emit-html", action="store_true")
     _ = scan.set_defaults(handler=_run_scan)
+
     return parser
 
 
@@ -610,3 +741,4 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     raise SystemExit(run_cli())
+    
