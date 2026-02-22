@@ -1,9 +1,9 @@
 """
 index_recurring_trades.py
 
-Indexes trades for the top 5,000 recurring Kalshi markets.
+Indexes trades for the top N recurring Kalshi markets.
 
-Kalshi hierarchy:  Series → Event → Market
+Kalshi hierarchy:  Series -> Event -> Market
   series_ticker : KXHIGHNY           (template: "Daily NYC High Temp")
   event_ticker  : KXHIGHNY-25JAN15   (one specific day)
   ticker        : KXHIGHNY-25JAN15-T45  (one tradeable threshold market)
@@ -12,17 +12,33 @@ series_ticker is NOT stored in the parquet (the indexer never fetched it),
 but it is derivable: strip the date suffix from event_ticker.
 
 Supported date suffix formats (applied in order):
-  1. -DDMMMDDYY  e.g. KXBTCD-26FEB0617  -> KXBTCD   (daily/hourly crypto with hour)
-  2. -DDMMMYY    e.g. KXHIGHNY-25JAN15  -> KXHIGHNY  (weather / standard daily)
+  1. -DDMMMDDDDDD  e.g. KXBTC15M-26FEB181715 -> KXBTC15M  (15-min intraday crypto)
+     Pattern: -[0-9]{2}[A-Z]{3}[0-9]{6}$
 
-We group by derived series_ticker and require COUNT(DISTINCT event_ticker) >= 10,
-which means the template repeated on at least 10 different days/instances.
+  2. -DDMMMDDHH    e.g. KXBTCD-26FEB0617  -> KXBTCD  (daily/hourly crypto with hour)
+     Pattern: -[0-9]{2}[A-Z]{3}[0-9]{4}$
+
+  3. -DDMMMYY      e.g. KXHIGHNY-25JAN15  -> KXHIGHNY  (weather / standard daily)
+     Pattern: -[0-9]{2}[A-Z]{3}[0-9]{2}$
+
+IMPORTANT: Pass 1 must run before Pass 2. The 6-digit 15M suffix (181715)
+would be partially matched by the 4-digit pattern (1817), producing a wrong
+series key like KXBTC15M-26FEB15 instead of KXBTC15M.
+
+NOTE: The regex is inlined directly into each f-string using {{2}} escaping.
+Do NOT extract it into a module-level string constant. A pre-built string
+embedded in an f-string does not have {{}} unescaped, so DuckDB receives
+literal {{2}} and throws an invalid regex error.
+
+We group by derived series_ticker and require COUNT(DISTINCT event_ticker)
+>= MIN_EVENT_INSTANCES, meaning the template recurred on at least N days.
 
 Crypto series included:
-  KXBTCD   - Daily BTC price markets (e.g. KXBTCD-26FEB0617)
-  KXBTCUP  - BTC Up or Down 15-minute / hourly markets
-  KXETH*   - Ethereum equivalent series
-  KXSOL*   - Solana equivalent series
+  KXBTCD    - Daily/hourly BTC price markets (e.g. KXBTCD-26FEB0617)
+  KXBTC15M  - BTC 15-minute markets (e.g. KXBTC15M-26FEB181715)
+  KXBTC     - BTC weekly/monthly markets
+  KXETHD    - Ethereum daily markets
+  KXSOL*    - Solana equivalent series
   etc.
 """
 
@@ -56,13 +72,13 @@ TRADES_DIR.mkdir(parents=True, exist_ok=True)
 MANIFEST.parent.mkdir(parents=True, exist_ok=True)
 
 BATCH_SIZE          = 10_000
-MAX_WORKERS         = 2       # kalshi rate-limits aggressively; keep this low
-MIN_VOLUME          = 150     # skip very thin markets
-MIN_EVENT_INSTANCES = 10      # series must have recurred at least 10 times
-LIMIT               = 80_000   # total markets to index
+MAX_WORKERS         = 2         # kalshi rate-limits aggressively; keep this low
+MIN_VOLUME          = 150       # skip very thin markets
+MIN_EVENT_INSTANCES = 10        # series must have recurred at least 10 times
+LIMIT               = 100_000   # total markets to index
 
 # ---------------------------------------------------------------------------
-# Thread-local KalshiClient — one persistent connection per worker thread
+# Thread-local KalshiClient -- one persistent connection per worker thread
 # ---------------------------------------------------------------------------
 _thread_local = threading.local()
 
@@ -72,7 +88,7 @@ def get_client() -> KalshiClient:
     return _thread_local.client
 
 # ---------------------------------------------------------------------------
-# Manifest — only records confirmed successes
+# Manifest -- only records confirmed successes
 # ---------------------------------------------------------------------------
 def load_manifest() -> set[str]:
     """Return set of tickers already successfully indexed."""
@@ -96,21 +112,10 @@ def append_manifest(tickers: list[str]) -> None:
 # ---------------------------------------------------------------------------
 def select_recurring_markets(limit: int) -> list[str]:
     """
-    Find the top `limit` markets from recurring series.
+    Find the top `limit` markets from recurring series, sorted by volume.
 
-    series_key derivation (two-pass regex, applied in order):
-
-      Pass 1 — strip crypto hour suffix:
-        KXBTCD-26FEB0617   ->  KXBTCD
-        KXBTCUP-26FEB0613  ->  KXBTCUP
-        Pattern: -[0-9]{2}[A-Z]{3}[0-9]{4}$   (2 digits, 3 letters, 4 digits)
-
-      Pass 2 — strip standard date suffix:
-        KXHIGHNY-25JAN15   ->  KXHIGHNY
-        KXRAINNYC-26MAR01  ->  KXRAINNYC
-        Pattern: -[0-9]{2}[A-Z]{3}[0-9]{2}$   (2 digits, 3 letters, 2 digits)
-
-    We require COUNT(DISTINCT event_ticker) >= MIN_EVENT_INSTANCES per series.
+    Three-pass regex derives series keys from event_ticker (see module docstring).
+    The regex is inlined in the f-string -- do not extract to a variable.
     """
     print("Scanning markets catalog for recurring series...")
 
@@ -120,12 +125,13 @@ def select_recurring_markets(limit: int) -> list[str]:
                 ticker,
                 event_ticker,
                 volume,
-                -- Two-pass series key derivation:
-                -- Pass 1: strip -DDMMMDDYY (crypto with hour, e.g. -26FEB0617)
-                -- Pass 2: strip -DDMMMYY   (standard daily, e.g. -25JAN15)
                 REGEXP_REPLACE(
                     REGEXP_REPLACE(
-                        event_ticker,
+                        REGEXP_REPLACE(
+                            event_ticker,
+                            '-[0-9]{{2}}[A-Z]{{3}}[0-9]{{6}}$',
+                            ''
+                        ),
                         '-[0-9]{{2}}[A-Z]{{3}}[0-9]{{4}}$',
                         ''
                     ),
@@ -138,14 +144,11 @@ def select_recurring_markets(limit: int) -> list[str]:
               AND event_ticker != ''
         ),
         recurring_series AS (
-            -- A recurring series has the same template run on many different days
             SELECT
                 series_key,
                 COUNT(DISTINCT event_ticker) AS event_instances,
                 SUM(volume)                  AS total_volume
             FROM all_markets
-            -- Exclude markets where the suffix wasn't stripped
-            -- (series_key == event_ticker means no date suffix was found)
             WHERE series_key != event_ticker
             GROUP BY series_key
             HAVING COUNT(DISTINCT event_ticker) >= {MIN_EVENT_INSTANCES}
@@ -182,7 +185,11 @@ def print_series_breakdown(tickers: list[str]) -> None:
         SELECT
             REGEXP_REPLACE(
                 REGEXP_REPLACE(
-                    event_ticker,
+                    REGEXP_REPLACE(
+                        event_ticker,
+                        '-[0-9]{{2}}[A-Z]{{3}}[0-9]{{6}}$',
+                        ''
+                    ),
                     '-[0-9]{{2}}[A-Z]{{3}}[0-9]{{4}}$',
                     ''
                 ),
@@ -207,7 +214,7 @@ def print_series_breakdown(tickers: list[str]) -> None:
     print()
 
 # ---------------------------------------------------------------------------
-# Fetch result — distinguishes success, empty, and error
+# Fetch result -- distinguishes success, empty, and error
 # ---------------------------------------------------------------------------
 class FetchResult(NamedTuple):
     ticker: str
@@ -230,7 +237,7 @@ def fetch_ticker(ticker: str) -> FetchResult:
         return FetchResult(ticker=ticker, trades=[], success=False, error=str(exc))
 
 # ---------------------------------------------------------------------------
-# Chunk file naming — sequential, thread-safe
+# Chunk file naming -- sequential, thread-safe
 # ---------------------------------------------------------------------------
 _chunk_counter = 0
 _chunk_lock    = threading.Lock()
@@ -280,7 +287,7 @@ def main() -> None:
         print(f"Nothing previously indexed. Fetching all {len(to_fetch):,} markets.\n")
 
     if not to_fetch:
-        print("All done — nothing to fetch.")
+        print("All done -- nothing to fetch.")
         return
 
     trades_batch: list[dict] = []

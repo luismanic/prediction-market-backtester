@@ -416,20 +416,22 @@ def _top_markets_by_volume(
 def _load_batch_checkpoint(path: Path) -> list[dict[str, object]]:
     if not path.exists():
         return []
-    payload = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
-    raw_entries = payload.get("entries", [])
-    if isinstance(raw_entries, list):
-        entries: list[dict[str, object]] = []
-        for item in cast(list[object], raw_entries):
-            if isinstance(item, dict):
-                entries.append(cast(dict[str, object], item))
-        return entries
-    return []
+    entries: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    entries.append(cast(dict[str, object], item))
+            except json.JSONDecodeError:
+                pass
+    return entries
 
 
 def _write_batch_checkpoint(path: Path, entries: list[dict[str, object]]) -> None:
-    payload = {"entries": entries}
-    _ = path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entries[-1], sort_keys=True) + "\n")
 
 
 def _resolve_batch_dir(*, output_root: Path, batch_name: str, resume: bool) -> Path:
@@ -488,6 +490,8 @@ def _run_batch(args: argparse.Namespace) -> int:
         safe_mkdir(runs_dir)
 
         checkpoint_path = batch_dir / "checkpoint.json"
+        if not cast(bool, args.resume) and checkpoint_path.exists():
+            checkpoint_path.unlink()
         checkpoint_entries = (
             _load_batch_checkpoint(checkpoint_path) if cast(bool, args.resume) else []
         )
