@@ -1,6 +1,7 @@
+# 10a — moderate scale-up
 strategy_name: favorite_longshot
 strategy_params:
   favorite_threshold: 0.85
-  qty: 5.0
+  qty: 20.0
   category_thresholds:
     KXBTCD: 0.90

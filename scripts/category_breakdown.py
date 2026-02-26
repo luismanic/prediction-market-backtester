@@ -1,7 +1,8 @@
 import pandas as pd
 
 RUNS = {
-    "Backtest #7 (Increased to 10k Markets)": r"D:\prediction-market-backtester\output\runs\kalshi_flb_10k_v8_20260222_014547_nogit\summary.csv",
+    "Backtest #10a ": r"D:\prediction-market-backtester\output\runs\kalshi_flb_10k_v10a_20260225_024635_nogit\summary.csv",
+    "Backtest #10b ": r"D:\prediction-market-backtester\output\runs\kalshi_flb_10k_v10b_20260226_004247_nogit\summary.csv",
 }
 
 for run_name, path in RUNS.items():

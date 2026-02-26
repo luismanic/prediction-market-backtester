@@ -73,9 +73,9 @@ MANIFEST.parent.mkdir(parents=True, exist_ok=True)
 
 BATCH_SIZE          = 10_000
 MAX_WORKERS         = 2         # kalshi rate-limits aggressively; keep this low
-MIN_VOLUME          = 150       # skip very thin markets
-MIN_EVENT_INSTANCES = 10        # series must have recurred at least 10 times
-LIMIT               = 100_000   # total markets to index
+MIN_VOLUME          = 10       # skip very thin markets
+MIN_EVENT_INSTANCES = 5        # series must have recurred at least 5 times
+LIMIT               = 500_000   # total markets to index
 
 # ---------------------------------------------------------------------------
 # Thread-local KalshiClient -- one persistent connection per worker thread

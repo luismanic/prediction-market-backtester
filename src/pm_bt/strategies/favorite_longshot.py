@@ -1,184 +1,145 @@
 """
-favorite_longshot.py  (Backtest v8 — Hourly Filter + 15M + Expanded Exclusions)
+favorite_longshot.py  (Backtest v9 — Per-Category Thresholds + Final Exclusions)
 
 Strategy: Fade Overpriced Favorites — Timeframe-Aware, Category-Filtered
 
 ═══════════════════════════════════════════════════════════════════════════
-BACKTEST #7 FINDINGS
+BACKTEST #8 FINDINGS
 ═══════════════════════════════════════════════════════════════════════════
 
-Total PnL: $5,586 across 8,603 markets (avg $0.65/market, 5.5% win rate)
+Total PnL: $5,779 across 8,809 markets (avg $0.66/market, 5.0% win rate)
 
-KXBTCD deep-dive revealed two completely different products mixed together:
+H1 — KXBTCD Daily Isolation: PARTIALLY FAILED
+  The hourly filter worked as intended, but the expected improvement in
+  win rate and avg/market did not materialize. Root cause: the 100k market
+  universe inflates KXBTCD market counts with dozens of un-triggered
+  strike prices per day. The 3.0% overall win rate is heavily diluted by
+  markets that never reached 85¢. The critical unknown is whether the
+  per-filled-trade win rate is still in the 18–22% range seen in late 2024.
 
-  KXBTCD Daily (settlement hour = 17):
-    - 753 markets | $2,545 PnL | $3.38/market | 18.9% win rate
-    - Consistent 17-23% win rate every single month Nov 2024 → Feb 2026
-    - No dead zones — edge is structural, not regime-dependent
-    - The real driver of BTC profits
+  Monthly detail exposed a regime shift:
+    Nov–Dec 2024: 22.2–22.4% win rate (clean structural edge)
+    Jan–Jun 2025: 0% win rate (dead zone — edge absent)
+    Jul–Dec 2025: 1–4% win rate (recovering but weak)
+    Jan–Feb 2026: 2.0–2.3% win rate but $1,629 PnL (volume-driven)
 
-  KXBTCD Hourly (settlement hour ≠ 17):
-    - 4,155 markets | -$97 PnL | -$0.02/market | 0.0% win rate
-    - Zero profitable markets across 15 months of data
-    - Pure noise — retail traders in hourly markets price correctly
-      (or the FLB bias doesn't manifest in short-resolution windows)
-    - Was contaminating aggregate stats and masking the clean daily edge
+  The 18.9% win rate from the #7 daily split may have been a late-2024
+  regime artifact. Requires filled-trade-only analysis to confirm.
 
-  KXBTC15M (15-minute markets, launched Jan 23 2026):
-    - NOT in Backtest #7 — trade data not indexed at time of run
-    - 6,383 markets in market catalog, volumes up to 291k
-    - Hypothesis: ultra-short timeframes may have STRONGER FLB
-      (retail traders making rapid binary decisions under time pressure
-      are more susceptible to behavioral bias at price extremes)
-    - Treat as isolated exploratory test — only ~4 weeks of data
+H2 — KXBTC15M Edge: DEFINITIVELY FAILED
+  -$26.30, 1,086 markets, 0% win rate. Zero profitable markets across
+  four weeks of data. These ultra-short markets are well-calibrated —
+  FLB does not manifest at 15-minute resolution. Permanently excluded.
 
-  Non-crypto universe:
-    - $3,138 PnL across 3,695 markets | $0.85/market | 8.8% win rate
-    - More capital-efficient per market than BTC daily
-    - Stable, consistent categories (political mentions, gas prices,
-      weather, approval ratings) — not regime-dependent
+H3 — Expanded Exclusions: CONFIRMED
+  All 13 excluded categories produced exactly $0. Exclusion list locked in.
 
-  Confirmed losers from #7 (expanding exclusion list):
-    - KXNFLMENTION:  -$32.90, 0% win rate (7 markets)
-    - KXSNFMENTION:  -$27.35, 10% win rate (10 markets, deep losses)
-    - INXU:          -$3.70,  2.9% win rate (34 markets)
-    - INX:           -$1.90,  0% win rate (119 markets)
-    - INXD:          -$1.25,  0.8% win rate (119 markets)
-    - INXDU:         -$0.10,  0% win rate (3 markets)
-    - KXSNLMENTION:  -$2.20,  0% win rate (7 markets)
-    - KXWTIW:        -$4.70,  16.7% win rate but erratic (6 markets)
+New losers identified in #8:
+  - KXBTC15M:   -$26.30, 0% win rate, 1,086 markets — permanently excluded
+  - KXHIGHMIA:   -$4.70, 4.6% win rate, 219 markets — weather markets are
+                  well-calibrated, same dynamic as KXRAINNYC
 
 ═══════════════════════════════════════════════════════════════════════════
-BACKTEST #8 HYPOTHESIS
+BACKTEST #9 HYPOTHESIS
 ═══════════════════════════════════════════════════════════════════════════
 
-Three separate hypotheses being tested simultaneously:
+One primary hypothesis, one diagnostic test:
 
-  H1 — KXBTCD Daily isolation:
-    The 18.9% win rate and $3.38/market average seen in the daily-only
-    split will hold when run cleanly without hourly contamination.
-    Removing 4,155 worthless hourly markets should improve aggregate
-    stats significantly (avg PnL/market, win rate %) while total PnL
-    remains similar to #7.
+  H1 — KXBTCD 90¢ threshold recovers the structural edge:
+    The 22% win rate in late 2024 required markets to be priced at extreme
+    certainty. As BTC markets have matured in 2025–2026, the FLB may only
+    manifest at higher price extremes. Raising KXBTCD's threshold from
+    85¢ to 90¢ filters to only the most overpriced favorites, potentially
+    restoring the high win rate even if fewer trades are taken.
 
-  H2 — KXBTC15M edge:
-    The favorite-longshot bias is amplified in ultra-short markets.
-    Retail traders placing 15-minute binary bets under time pressure
-    exhibit stronger anchoring and overconfidence at price extremes
-    (≥85¢) than in daily markets. If the bias holds, we should see
-    a positive win rate despite only 4 weeks of data.
-    IMPORTANT: This is exploratory only — insufficient data to draw
-    conclusions. Any result here requires confirmation in Backtest #9
-    after more history accumulates.
+    Prediction: KXBTCD win rate recovers to >10% at 90¢+, with higher
+    avg PnL per market. Total KXBTCD PnL may be lower (fewer triggers)
+    but risk-adjusted quality improves.
 
-  H3 — Expanded exclusions improve risk-adjusted returns:
-    Removing 9 confirmed losing categories (adding INX series, NFL/SNF
-    mentions, SNL mentions, crude oil weekly to the existing 4 exclusions)
-    will reduce total losses, improve the Sharpe-equivalent metric, and
-    prove these categories have genuinely different dynamics where the
-    FLB doesn't apply (well-calibrated markets, sophisticated participants,
-    or mean-reverting underlyings).
+  DIAGNOSTIC — Filled-trades-only analysis:
+    Run scripts/filled_trades_analysis.py after the batch to compute win
+    rates only for markets where fills_count > 0. This separates the
+    true edge signal from universe dilution noise. If KXBTCD filled-trade
+    win rate is still 15–22%, the edge is intact and the issue is purely
+    analytical. If it is 3–5%, the edge has structurally weakened.
+
+  NOTE: Non-crypto categories remain at 0.85 threshold (unchanged).
+  Avoid touching what's working.
 
 ═══════════════════════════════════════════════════════════════════════════
-CHANGES FROM V6/V7
+CHANGES FROM V8
 ═══════════════════════════════════════════════════════════════════════════
 
-  1. Added KXBTCD hourly filter — skips any KXBTCD market where the
-     settlement hour (characters 7-8 of the date segment) is not "17".
-     This is the single most important change.
-
-  2. Added KXBTC15M explicit pass-through — no filtering applied,
-     treated as a standard series for the strategy to evaluate.
-
-  3. Expanded EXCLUDED_PREFIXES from 4 to 13 categories based on
-     confirmed multi-backtest losing patterns from #7.
-
-  4. favorite_threshold: 0.85 (unchanged)
+  1. KXBTC15M added to EXCLUDED_PREFIXES — H2 definitively failed (#8)
+  2. KXHIGHMIA added to EXCLUDED_PREFIXES — well-calibrated weather market
+  3. category_thresholds dict added — KXBTCD overridden to 0.90
+     All other categories continue using favorite_threshold = 0.85
+  4. favorite_threshold: 0.85 (unchanged — applies to all non-overridden)
   5. Side: SELL YES (unchanged)
   6. qty: 5.0 (unchanged)
-
-═══════════════════════════════════════════════════════════════════════════
-EXPECTED OUTCOMES
-═══════════════════════════════════════════════════════════════════════════
-
-  - Total PnL:       ~$5,500-6,000 (similar to #7, noise removed)
-  - Avg PnL/market:  >$1.00 (up from $0.65 — hourly drag removed)
-  - Overall win rate: >8% (up from 5.5%)
-  - KXBTCD daily:    ~$2,500+ | ~18-19% win rate | $3.00+/market
-  - KXBTCD hourly:   $0 (filtered out entirely)
-  - KXBTC15M:        Unknown — first look, any positive result is signal
-  - Non-crypto:      ~$3,100+ (unchanged, exclusions add marginal cleanup)
-
-  If H1 confirmed → daily KXBTCD is a validated structural edge, ready
-  to inform live trading sizing decisions.
-
-  If H2 shows positive KXBTC15M signal → schedule Backtest #9 after
-  2-3 more months of 15M data to confirm.
-
-  If H3 confirmed → permanently lock in 13-category exclusion list.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pm_bt.common.models import Bar, OrderIntent
 from pm_bt.common.types import OrderSide
 from pm_bt.strategies.base import FeatureMap
 
 # Settlement hour for KXBTCD daily markets (UTC)
-# All other hours are hourly markets — excluded from strategy
 KXBTCD_DAILY_HOUR = "17"
 
 
 @dataclass(slots=True)
 class FavoriteLongshotStrategy:
     """
-    Reverse Favorite-Longshot Bias v8 — Timeframe-Aware, Category-Filtered.
+    Reverse Favorite-Longshot Bias v9 — Per-Category Thresholds.
 
     Core logic:
-      - SELL YES when bar.close >= favorite_threshold
+      - SELL YES when bar.close >= threshold for that category
+      - KXBTCD uses a higher threshold (0.90) to filter for extreme pricing
+      - All other categories use the default favorite_threshold (0.85)
       - Skip hourly KXBTCD markets (only trade daily settlement at 17:00)
-      - Skip all confirmed losing categories
-
-    KXBTCD market ID format:
-      KXBTCD-26FEB0617-T70749.99
-             ^^^^^^^^ date+hour segment
-               26FEB06 = date, 17 = settlement hour (UTC)
-      Characters [7:9] of the date segment give the 2-digit hour.
-
-    KXBTC15M market ID format:
-      KXBTC15M-26FEB181715-15
-      No filtering applied — all 15M markets are evaluated.
+      - Skip all confirmed losing categories (15 total)
     """
 
     favorite_threshold: float = 0.85
     qty:                float = 5.0
 
-    # ── Confirmed losers: 0% or near-0% win rate across multiple backtests ──
-    # Original 4 from v6:
-    #   KXEOWEEK      — crude oil weekly, well-calibrated, 0% win rate
-    #   KXRAINNYC     — NYC rain, model-accurate, 0% win rate
-    #   KXNETFLIXRANKMOVIE — streaming rankings, efficient, 0% win rate
-    #   KXSPOTIFYW    — Spotify weekly, efficient, 0% win rate
+    # ── Per-category threshold overrides ──────────────────────────────────
+    # Only specify categories where you want a DIFFERENT threshold than
+    # favorite_threshold. Everything else uses favorite_threshold.
     #
-    # New additions from Backtest #7:
-    #   KXNFLMENTION  — NFL mentions: -$32.90, 0% win rate
-    #   KXSNFMENTION  — SNF mentions: -$27.35, erratic losses
-    #   INX           — S&P 500:      -$1.90,  0% win rate
-    #   INXD          — S&P 500 down: -$1.25,  0.8% win rate
-    #   INXU          — S&P 500 up:   -$3.70,  2.9% win rate
-    #   INXDU         — S&P 500 du:   -$0.10,  0% win rate
-    #   KXSNLMENTION  — SNL mentions: -$2.20,  0% win rate
-    #   KXWTIW        — crude oil wk: -$4.70,  inconsistent
-    #   NASDAQ100D    — Nasdaq down:  +$1.20,  0.7% win rate (near zero)
+    # KXBTCD @ 0.90: Testing whether the FLB in Bitcoin daily markets only
+    # manifests at extreme pricing (≥90¢). Late-2024 produced 22% win rates;
+    # 2025-2026 at 85¢ produced near-zero win rates. This tests whether
+    # tighter filtering restores quality while reducing quantity.
+    category_thresholds: dict = field(default_factory=lambda: {
+        "KXBTCD": 0.90,
+    })
+
+    # ── Confirmed losers: permanently excluded ─────────────────────────────
+    # v6 originals (4):
+    #   KXEOWEEK      — crude oil weekly, well-calibrated
+    #   KXRAINNYC     — NYC rain, model-accurate weather
+    #   KXNETFLIXRANKMOVIE — streaming rankings, efficient
+    #   KXSPOTIFYW    — Spotify weekly, efficient
+    #
+    # v8 additions from Backtest #7 losers (9):
+    #   KXNFLMENTION, KXSNFMENTION, INX, INXD, INXU, INXDU,
+    #   KXSNLMENTION, KXWTIW, NASDAQ100D
+    #
+    # v9 additions from Backtest #8 losers (2):
+    #   KXBTC15M    — 0% win rate, 1,086 markets, FLB absent at 15m
+    #   KXHIGHMIA   — 4.6% win rate, 219 markets, well-calibrated weather
     EXCLUDED_PREFIXES: frozenset = frozenset({
-        # Original exclusions (v6)
+        # v6 exclusions
         "KXEOWEEK",
         "KXRAINNYC",
         "KXNETFLIXRANKMOVIE",
         "KXSPOTIFYW",
-        # New exclusions (v8) — confirmed losers from Backtest #7
+        # v8 exclusions
         "KXNFLMENTION",
         "KXSNFMENTION",
         "INX",
@@ -188,6 +149,9 @@ class FavoriteLongshotStrategy:
         "KXSNLMENTION",
         "KXWTIW",
         "NASDAQ100D",
+        # v9 exclusions
+        "KXBTC15M",
+        "KXHIGHMIA",
     })
 
     def _is_kxbtcd_hourly(self, market_id: str) -> bool:
@@ -196,11 +160,9 @@ class FavoriteLongshotStrategy:
 
         KXBTCD daily markets settle at hour 17 UTC.
         Format: KXBTCD-26FEB0617-T70749.99
-                         ^^^^^^^
-                         [0:7] = date (26FEB06)
-                         [7:9] = hour (17)
+                         [7:9] = settlement hour
 
-        Any KXBTCD market with settlement hour != 17 is an hourly market.
+        Any settlement hour != 17 is an intraday/hourly market.
         """
         if not market_id.startswith("KXBTCD-"):
             return False
@@ -210,8 +172,17 @@ class FavoriteLongshotStrategy:
         date_hour_segment = parts[1]          # e.g. "26FEB0617"
         if len(date_hour_segment) < 9:
             return False
-        settlement_hour = date_hour_segment[7:9]  # e.g. "17"
+        settlement_hour = date_hour_segment[7:9]
         return settlement_hour != KXBTCD_DAILY_HOUR
+
+    def _get_threshold(self, market_prefix: str) -> float:
+        """
+        Returns the entry threshold for a given category prefix.
+
+        Checks category_thresholds first; falls back to favorite_threshold.
+        This allows per-category tuning without touching the default.
+        """
+        return self.category_thresholds.get(market_prefix, self.favorite_threshold)
 
     def on_bar(self, bar: Bar, features: FeatureMap) -> list[OrderIntent]:
         price = bar.close
@@ -222,12 +193,12 @@ class FavoriteLongshotStrategy:
             return []
 
         # ── Filter 2: Skip KXBTCD hourly markets ──
-        # Only trade KXBTCD when settlement hour == 17 (daily markets)
         if self._is_kxbtcd_hourly(bar.market_id):
             return []
 
-        # ── Entry: Sell overpriced favorites ──
-        if price >= self.favorite_threshold:
+        # ── Entry: Sell overpriced favorites (category-aware threshold) ──
+        threshold = self._get_threshold(market_prefix)
+        if price >= threshold:
             return [
                 OrderIntent(
                     ts=bar.ts_close,
@@ -238,7 +209,7 @@ class FavoriteLongshotStrategy:
                     qty=self.qty,
                     limit_price=price,
                     target_position=-self.qty,
-                    reason="flb_favorite_reverse_v8",
+                    reason=f"flb_favorite_reverse_v9",
                 )
             ]
 
